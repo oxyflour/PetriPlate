@@ -1,0 +1,21 @@
+{
+  "name": "app",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "dependencies": {
+    "next": "^16.1.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "@types/react": "^18.3.28",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,42 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "Segoe UI", "PingFang SC", sans-serif;
+  background: #f5f7fb;
+  color: #141a24;
+}
+
+.agent-view-chat {
+  min-height: 620px;
+  border: 1px solid #d7dfef;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.agent-view-layout {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@media (min-width: 981px) {
+  .agent-view-layout {
+    align-items: start;
+    grid-template-columns: minmax(0, 1fr) 340px;
+  }
+}
+
+@media (max-width: 980px) {
+  .agent-view-chat {
+    min-height: 540px;
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "@petri/agent-view",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{ recursive: true, force: true })\"",
+    "build": "npx pnpm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "example:dev": "npx pnpm --filter @petri/agent-view-example dev",
+    "example:build": "npx pnpm --filter @petri/agent-view-example build"
+  },
+  "peerDependencies": {
+    "@copilotkit/react-core": "^1.52.1",
+    "react": "^18.3.1 || ^19.0.0"
+  },
+  "devDependencies": {
+    "@copilotkit/react-core": "^1.52.1",
+    "@types/react": "^18.3.28",
+    "react": "^18.3.1",
+    "typescript": "^5.9.3"
+  }
+}

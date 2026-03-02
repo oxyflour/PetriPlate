@@ -1,0 +1,2 @@
+- 实现一个基本的 `copilotkit` 的前端 `react` 库，需要实现 `useFrontendTools` 这个 hook
+- 基本用例放到 examples 文件夹下面

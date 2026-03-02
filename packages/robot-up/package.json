@@ -1,0 +1,24 @@
+{
+  "name": "@petriplate/robot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "sim:mujoco": "uv run python sim/mujoco_ws_bridge.py",
+    "sim:mujoco:panda": "uv run python sim/mujoco_ws_bridge.py --model third_party/mujoco_menagerie/franka_emika_panda/scene.xml --body-name link0",
+    "sim:arm-demo": "uv run python sim/run_open_source_arm_demo.py"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "sparkjs": "^0.2.4",
+    "three": "^0.181.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "vite": "^6.4.1"
+  }
+}
