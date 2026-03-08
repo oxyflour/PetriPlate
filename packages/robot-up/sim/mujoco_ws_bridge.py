@@ -27,7 +27,6 @@ GEOM_TYPE_LABELS: dict[int, str] = {
 
 
 def euler_to_quat(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
-    """Convert Euler angles to quaternion in wxyz order."""
     cr = math.cos(roll * 0.5)
     sr = math.sin(roll * 0.5)
     cp = math.cos(pitch * 0.5)
@@ -64,12 +63,7 @@ def quat_normalize(quat: tuple[float, float, float, float]) -> tuple[float, floa
     norm = math.sqrt(sum(v * v for v in quat))
     if norm <= 1e-12:
         return (1.0, 0.0, 0.0, 0.0)
-    return (
-        quat[0] / norm,
-        quat[1] / norm,
-        quat[2] / norm,
-        quat[3] / norm,
-    )
+    return (quat[0] / norm, quat[1] / norm, quat[2] / norm, quat[3] / norm)
 
 
 def rotate_vector_by_quat(
@@ -94,6 +88,10 @@ def build_relative_pose_from_world(
     rel_pos = rotate_vector_by_quat(root_inv_quat, rel_offset)
     rel_quat = quat_normalize(quat_multiply(root_inv_quat, quat_normalize(node_quat)))
     return rel_pos, rel_quat
+
+
+def identity_pose() -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    return (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)
 
 
 def vec3_payload(values: list[float]) -> dict[str, float]:
@@ -146,12 +144,15 @@ def resolve_mesh_file(model_dir: Path, mesh_ref: str, file_index: dict[str, list
     return matches[0].resolve()
 
 
-def build_mesh_url(mesh_file: Path, asset_url_prefix: str) -> str:
-    prefix = asset_url_prefix.strip() or "/@fs"
-    if not prefix.endswith("/"):
-        prefix = f"{prefix}/"
-    mesh_path = quote(mesh_file.resolve().as_posix(), safe="/:")
-    return f"{prefix}{mesh_path}"
+def build_asset_url(mesh_file: Path, asset_root: Path, asset_url_prefix: str) -> str | None:
+    try:
+        relative_path = mesh_file.resolve().relative_to(asset_root.resolve())
+    except ValueError:
+        return None
+
+    prefix = asset_url_prefix.rstrip("/")
+    quoted_path = "/".join(quote(part) for part in relative_path.parts)
+    return f"{prefix}/{quoted_path}"
 
 
 def collect_body_subtree(model: mujoco.MjModel, root_body_id: int) -> list[int]:
@@ -176,13 +177,14 @@ def collect_body_subtree(model: mujoco.MjModel, root_body_id: int) -> list[int]:
 def build_model_manifest(
     model: mujoco.MjModel,
     model_path: Path,
+    asset_root: Path,
     body_id: int,
     body_name: str,
     asset_url_prefix: str,
 ) -> dict[str, Any]:
     model_file = model_path.resolve()
     model_dir = model_file.parent
-    file_index = build_file_index(model_dir)
+    file_index = build_file_index(asset_root)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     body_subtree_ids = collect_body_subtree(model, body_id)
@@ -195,18 +197,28 @@ def build_model_manifest(
         subtree_body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, subtree_body_id)
         subtree_body_pos = tuple(float(v) for v in data.xpos[subtree_body_id])
         subtree_body_quat = tuple(float(v) for v in data.xquat[subtree_body_id])
-        rel_pos, rel_quat = build_relative_pose_from_world(
-            root_pos=root_pos,
-            root_quat=root_quat,
-            node_pos=subtree_body_pos,
-            node_quat=subtree_body_quat,
-        )
         parent_id = int(model.body_parentid[subtree_body_id])
+        if subtree_body_id == body_id or parent_id == subtree_body_id:
+            normalized_parent_id = -1
+            rel_pos, rel_quat = identity_pose()
+        elif parent_id in body_subtree_set:
+            normalized_parent_id = parent_id
+            parent_pos = tuple(float(v) for v in data.xpos[parent_id])
+            parent_quat = tuple(float(v) for v in data.xquat[parent_id])
+            rel_pos, rel_quat = build_relative_pose_from_world(
+                root_pos=parent_pos,
+                root_quat=parent_quat,
+                node_pos=subtree_body_pos,
+                node_quat=subtree_body_quat,
+            )
+        else:
+            normalized_parent_id = -1
+            rel_pos, rel_quat = identity_pose()
         bodies.append(
             {
                 "id": subtree_body_id,
                 "name": subtree_body_name or f"body_{subtree_body_id}",
-                "parent_id": parent_id if parent_id in body_subtree_set else -1,
+                "parent_id": normalized_parent_id,
                 "position": vec3_payload(list(rel_pos)),
                 "quaternion": quat_payload(list(rel_quat)),
             }
@@ -257,14 +269,12 @@ def build_model_manifest(
                 mesh_path_adr = int(model.mesh_pathadr[mesh_id])
                 mesh_ref = decode_c_string(model.paths, mesh_path_adr) if mesh_path_adr >= 0 else ""
                 mesh_file = resolve_mesh_file(model_dir, mesh_ref, file_index) if mesh_ref else None
-                if mesh_file is None:
-                    if mesh_ref:
-                        print(f"[model] warning: failed to resolve mesh '{mesh_ref}'")
-                    mesh_url = None
-                    mesh_format = Path(mesh_ref).suffix.lower().lstrip(".")
-                else:
-                    mesh_url = build_mesh_url(mesh_file, asset_url_prefix)
-                    mesh_format = mesh_file.suffix.lower().lstrip(".")
+                mesh_url = (
+                    build_asset_url(mesh_file, asset_root, asset_url_prefix)
+                    if mesh_file is not None
+                    else None
+                )
+                mesh_format = (mesh_file or Path(mesh_ref)).suffix.lower().lstrip(".")
 
                 geom_payload["mesh"] = {
                     "id": mesh_id,
@@ -370,7 +380,6 @@ class PoseBroadcaster:
 
         message = json.dumps(payload, separators=(",", ":"))
         stale: list[websockets.ServerConnection] = []
-
         for client in list(self.clients):
             try:
                 await client.send(message)
@@ -383,29 +392,35 @@ class PoseBroadcaster:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a headless Mujoco simulation and broadcast pose through websocket."
+        description="Run a headless MuJoCo simulation and broadcast pose over websocket."
+    )
+    parser.add_argument("--model", type=Path, required=True, help="Path to MJCF XML model.")
+    parser.add_argument(
+        "--asset-root",
+        type=Path,
+        default=None,
+        help="Asset root used to resolve and expose mesh files.",
     )
     parser.add_argument(
-        "--model",
-        type=Path,
-        default=Path(__file__).parent / "models" / "free_body.xml",
-        help="Path to MJCF XML model.",
+        "--body-name",
+        type=str,
+        default="",
+        help="Optional subtree root body name. Defaults to the MuJoCo world body.",
     )
-    parser.add_argument("--body-name", type=str, default="robot", help="Body name to stream.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Websocket host.")
     parser.add_argument("--port", type=int, default=8765, help="Websocket port.")
     parser.add_argument(
         "--asset-url-prefix",
         type=str,
-        default="/@fs",
-        help="Mesh URL prefix for browser loading (defaults to Vite /@fs).",
+        default="/api/mujoco/assets",
+        help="HTTP asset prefix used in model manifest mesh URLs.",
     )
     parser.add_argument("--sim-hz", type=float, default=120.0, help="Simulation step frequency.")
     parser.add_argument("--publish-hz", type=float, default=30.0, help="Pose publish frequency.")
     parser.add_argument(
         "--disable-demo-drive",
         action="store_true",
-        help="Disable automatic actuator driving when streamed body has no freejoint.",
+        help="Disable automatic actuator driving when there is no freejoint.",
     )
     parser.add_argument(
         "--duration",
@@ -452,17 +467,26 @@ def build_pose_frame_payload(
     root_pos = tuple(float(v) for v in data.xpos[root_body_id])
     root_quat = tuple(float(v) for v in data.xquat[root_body_id])
     body_entries: list[dict[str, Any]] = []
+    subtree_body_set = set(subtree_body_ids)
 
     for subtree_body_id in subtree_body_ids:
         subtree_body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, subtree_body_id)
         subtree_body_pos = tuple(float(v) for v in data.xpos[subtree_body_id])
         subtree_body_quat = tuple(float(v) for v in data.xquat[subtree_body_id])
-        rel_pos, rel_quat = build_relative_pose_from_world(
-            root_pos=root_pos,
-            root_quat=root_quat,
-            node_pos=subtree_body_pos,
-            node_quat=subtree_body_quat,
-        )
+        parent_id = int(model.body_parentid[subtree_body_id])
+        if subtree_body_id == root_body_id or parent_id == subtree_body_id:
+            rel_pos, rel_quat = identity_pose()
+        elif parent_id in subtree_body_set:
+            parent_pos = tuple(float(v) for v in data.xpos[parent_id])
+            parent_quat = tuple(float(v) for v in data.xquat[parent_id])
+            rel_pos, rel_quat = build_relative_pose_from_world(
+                root_pos=parent_pos,
+                root_quat=parent_quat,
+                node_pos=subtree_body_pos,
+                node_quat=subtree_body_quat,
+            )
+        else:
+            rel_pos, rel_quat = identity_pose()
         body_entries.append(
             {
                 "id": subtree_body_id,
@@ -529,39 +553,57 @@ def set_demo_controls(model: mujoco.MjModel, data: mujoco.MjData, sim_time: floa
         data.ctrl[actuator_id] = target
 
 
+def pick_root_body(model: mujoco.MjModel, body_name: str) -> tuple[int, str]:
+    if body_name:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id < 0:
+            raise ValueError(f"Body '{body_name}' not found in model.")
+        resolved_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or body_name
+        return body_id, resolved_name
+
+    resolved_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, 0) or "world"
+    return 0, resolved_name
+
+
+def find_first_freejoint_qpos_adr(model: mujoco.MjModel, subtree_body_ids: list[int]) -> int | None:
+    subtree_set = set(subtree_body_ids)
+    for joint_id in range(model.njnt):
+        body_id = int(model.jnt_bodyid[joint_id])
+        if body_id not in subtree_set:
+            continue
+        if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+            return int(model.jnt_qposadr[joint_id])
+    return None
+
+
 async def run_bridge(args: argparse.Namespace) -> None:
     if not args.model.exists():
         raise FileNotFoundError(f"Model not found: {args.model}")
 
+    asset_root = (args.asset_root or args.model.parent).resolve()
     model = mujoco.MjModel.from_xml_path(str(args.model))
     data = mujoco.MjData(model)
-
-    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, args.body_name)
-    if body_id < 0:
-        raise ValueError(f"Body '{args.body_name}' not found in model: {args.model}")
+    body_id, body_name = pick_root_body(model, args.body_name.strip())
     subtree_body_ids = collect_body_subtree(model, body_id)
 
     model_manifest = build_model_manifest(
         model=model,
         model_path=args.model,
+        asset_root=asset_root,
         body_id=body_id,
-        body_name=args.body_name,
+        body_name=body_name,
         asset_url_prefix=args.asset_url_prefix,
     )
     print(
-        f"[model] manifest ready for body '{args.body_name}' with "
+        f"[model] manifest ready for body '{body_name}' with "
         f"{model_manifest['geom_count']} geoms ({model_manifest['mesh_count']} meshes)"
     )
 
-    qpos_adr: int | None = None
-    joint_id = model.body_jntadr[body_id]
-    if joint_id >= 0 and model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
-        qpos_adr = int(model.jnt_qposadr[joint_id])
-        print(f"[sim] freejoint detected at qpos[{qpos_adr}] for body '{args.body_name}'")
+    qpos_adr = find_first_freejoint_qpos_adr(model, subtree_body_ids)
+    if qpos_adr is not None:
+        print(f"[sim] freejoint detected at qpos[{qpos_adr}]")
     else:
-        print(
-            "[sim] body has no freejoint; running pure physics stepping."
-        )
+        print("[sim] no subtree freejoint found; running physics stepping.")
 
     disable_demo_drive = bool(getattr(args, "disable_demo_drive", False))
     drive_actuators = qpos_adr is None and model.nu > 0 and not disable_demo_drive
@@ -597,7 +639,7 @@ async def run_bridge(args: argparse.Namespace) -> None:
                 seq += 1
                 payload = build_pose_payload(
                     seq=seq,
-                    body_name=args.body_name,
+                    body_name=body_name,
                     sim_time=float(data.time),
                     position=[float(v) for v in data.xpos[body_id]],
                     quaternion=[float(v) for v in data.xquat[body_id]],
@@ -605,7 +647,7 @@ async def run_bridge(args: argparse.Namespace) -> None:
                 await broadcaster.broadcast(payload)
                 frame_payload = build_pose_frame_payload(
                     seq=seq,
-                    body_name=args.body_name,
+                    body_name=body_name,
                     sim_time=float(data.time),
                     model=model,
                     data=data,

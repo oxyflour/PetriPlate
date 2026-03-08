@@ -1,11 +1,10 @@
 [project]
-name = "petriplate-robot-sim"
+name = "petriplate-robot-up2-sim"
 version = "0.1.0"
-description = "Headless Mujoco simulation broadcaster over websocket"
-readme = "README.md"
+description = "MuJoCo bridge for robot-up2"
+readme = "tasks/01-fork-mujoco.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "mujoco>=3.2.6",
-  "pillow>=11.0.0",
   "websockets>=12.0",
 ]

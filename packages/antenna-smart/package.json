@@ -1,5 +1,5 @@
 {
-  "name": "@petriplate/robot-up2",
+  "name": "@petriplate/antenna-smart",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -7,11 +7,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "sim:mujoco": "uv run python sim/mujoco_ws_bridge.py --model sim/models/free_body.xml",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "jszip": "^3.10.1",
+    "manifold-3d": "^3.3.2",
     "next": "^16.1.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
