@@ -5,9 +5,9 @@ export const DEFAULT_PHONE_CONFIG: PhoneConfig = {
   frame: {
     thickness: 3.2,
     seams: [
-      { position: "top", width: 10, distance: 0 },
-      { position: "left", width: 8, distance: 30 },
-      { position: "right", width: 8, distance: -22 }
+      { position: "top", width: 2, distance: 0 },
+      { position: "left", width: 2, distance: 30 },
+      { position: "right", width: 2, distance: -22 }
     ]
   }
 };

@@ -41,9 +41,9 @@ export function buildPhoneFramePreview({
   let projected: CrossSectionInstance | null = null;
   let offsetInner: CrossSectionInstance | null = null;
   let inner: CrossSectionInstance | null = null;
-  let removalSection: CrossSectionInstance | null = null;
   let frameSection: CrossSectionInstance | null = null;
-  let removalVolume: ManifoldInstance | null = null;
+  let innerBottom: ManifoldInstance | null = null;
+  let innerVolume: ManifoldInstance | null = null;
   let frameResult: ManifoldInstance | null = null;
 
   try {
@@ -56,25 +56,62 @@ export function buildPhoneFramePreview({
       throw new Error("Inner outline collapsed. Reduce frame.thickness.");
     }
 
-    removalSection = extendRemovalSection(
-      inner,
-      runtime,
-      config.frame.seams,
-      size,
-      config.frame.thickness
-    );
-    frameSection = projected.subtract(removalSection);
+    frameSection = projected.subtract(inner);
 
     if (frameSection.isEmpty()) {
-      throw new Error("All frame material was removed by seam cuts.");
+      throw new Error("Inner outline removed the entire frame.");
     }
 
-    removalVolume = removalSection.extrude(size.z, 0, 0, 1, true);
-    frameResult = sourceBody.subtract(removalVolume);
+    const booleanOvershoot = getBooleanOvershoot(size, config.frame.thickness);
+    const booleanHeight = size.z + booleanOvershoot * 2;
+
+    innerVolume = inner.extrude(booleanHeight, 0, 0);
+    innerBottom = innerVolume.translate(0, 0, boundingBox.min.z-booleanOvershoot);
+    frameResult = sourceBody.subtract(innerBottom);
 
     if (frameResult.isEmpty()) {
       throw new Error("Frame boolean result is empty.");
     }
+
+    const seamCutDepth = getSeamCutDepth(size, config.frame.thickness);
+    let currentFrameSection = frameSection;
+    let currentFrameResult = frameResult;
+
+    for (const seam of config.frame.seams) {
+      const seamSection = createSeamCutter(
+        runtime,
+        seam.position,
+        seam.distance,
+        seam.width,
+        size,
+        seamCutDepth
+      );
+      const nextFrameSection = currentFrameSection.subtract(seamSection);
+      const seamVolume = seamSection.extrude(booleanHeight, 0, 0, [1, 1], true);
+      const nextFrameResult = currentFrameResult.subtract(seamVolume);
+      const simplifiedFrameSection = nextFrameSection.simplify(Math.max(seam.width / 64, 1e-4));
+
+      tryDelete(seamSection);
+      tryDelete(seamVolume);
+      if (currentFrameSection !== simplifiedFrameSection) {
+        tryDelete(currentFrameSection);
+      }
+      if (currentFrameResult !== nextFrameResult) {
+        tryDelete(currentFrameResult);
+      }
+      if (nextFrameSection !== simplifiedFrameSection) {
+        tryDelete(nextFrameSection);
+      }
+      currentFrameSection = simplifiedFrameSection;
+      currentFrameResult = nextFrameResult;
+
+      if (currentFrameSection.isEmpty() || currentFrameResult.isEmpty()) {
+        throw new Error("All frame material was removed by seam cuts.");
+      }
+    }
+
+    frameSection = currentFrameSection;
+    frameResult = currentFrameResult;
 
     const frameGeometry = manifoldToBufferGeometry(frameResult);
     frameGeometry.computeBoundingBox();
@@ -102,11 +139,8 @@ export function buildPhoneFramePreview({
     throw error;
   } finally {
     tryDelete(frameResult);
-    tryDelete(removalVolume);
+    tryDelete(innerVolume);
     tryDelete(frameSection);
-    if (removalSection !== inner) {
-      tryDelete(removalSection);
-    }
     tryDelete(inner);
     tryDelete(offsetInner);
     tryDelete(projected);
@@ -114,39 +148,12 @@ export function buildPhoneFramePreview({
   }
 }
 
-function extendRemovalSection(
-  baseInner: CrossSectionInstance,
-  runtime: BuildPreviewOptions["runtime"],
-  seams: BuildPreviewOptions["config"]["frame"]["seams"],
-  size: THREE.Vector3,
-  thickness: number
-) {
-  let current = baseInner;
-  const cutDepth = Math.max(thickness * 1.35, Math.min(size.x, size.y) * 0.03);
+function getSeamCutDepth(size: THREE.Vector3, thickness: number) {
+  return Math.max(thickness * 1.35, Math.min(size.x, size.y) * 0.03);
+}
 
-  for (const seam of seams) {
-    const cutter = createSeamCutter(
-      runtime,
-      seam.position,
-      seam.distance,
-      seam.width,
-      size,
-      cutDepth
-    );
-    const unioned = current.add(cutter);
-    const next = unioned.simplify(Math.max(seam.width / 64, 1e-4));
-
-    if (current !== baseInner) {
-      tryDelete(current);
-    }
-    tryDelete(cutter);
-    if (unioned !== next) {
-      tryDelete(unioned);
-    }
-    current = next;
-  }
-
-  return current;
+function getBooleanOvershoot(size: THREE.Vector3, thickness: number) {
+  return Math.max(thickness * 0.5, size.z * 0.05, 0.1);
 }
 
 function createSeamCutter(

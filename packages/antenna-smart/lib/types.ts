@@ -85,7 +85,7 @@ export type CrossSectionInstance = {
     height: number,
     nDivisions?: number,
     twistDegrees?: number,
-    scaleTop?: number | readonly [number, number],
+    scaleTop?: readonly [number, number],
     center?: boolean
   ) => ManifoldInstance;
   isEmpty: () => boolean;
