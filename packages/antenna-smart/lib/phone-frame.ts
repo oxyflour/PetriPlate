@@ -140,6 +140,7 @@ export function buildPhoneFramePreview({
   } finally {
     tryDelete(frameResult);
     tryDelete(innerVolume);
+    tryDelete(innerBottom);
     tryDelete(frameSection);
     tryDelete(inner);
     tryDelete(offsetInner);
