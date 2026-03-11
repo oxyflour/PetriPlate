@@ -359,6 +359,10 @@ code {
   background: var(--accent-2);
 }
 
+.legend-chip.rib {
+  background: #ffd36a;
+}
+
 @media (max-width: 1060px) {
   .workspace {
     grid-template-columns: 1fr;

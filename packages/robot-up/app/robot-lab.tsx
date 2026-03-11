@@ -33,9 +33,10 @@ const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   isaacsim: "Isaac Sim"
 };
 
-const ACCEPT_ATTR = ".xml,.mjcf,.zip,.usda,.usd,.usdc,.obj,.stl,.msh";
+const ACCEPT_ATTR = ".xml,.mjcf,.zip,.urdf,.usda,.usd,.usdc,.obj,.stl,.msh";
 const COLLAPSED_ENTRY_COUNT = 6;
 const HEARTBEAT_INTERVAL_MS = 10_000;
+const ISAAC_STATUS_POLL_INTERVAL_MS = 1_000;
 
 type SessionStatus = "idle" | "starting" | "ready" | "error";
 type ConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
@@ -354,7 +355,12 @@ export default function RobotLab() {
           return;
         }
         setIsaacSession(session);
-        setIsaacSessionStatus("ready");
+        setIsaacSessionStatus(resolveIsaacSessionStatus(session));
+        if (session.status === "error") {
+          setIsaacSessionError(session.statusMessage);
+        } else {
+          setIsaacSessionError(null);
+        }
       })
       .catch((nextError) => {
         if (!active || controller.signal.aborted) {
@@ -374,6 +380,59 @@ export default function RobotLab() {
       }
     };
   }, [currentIsaacEntryPath, currentRuntime, sourceFile]);
+
+  useEffect(() => {
+    if (!isaacSession?.sessionId || isaacSession.status !== "starting") {
+      return undefined;
+    }
+
+    let active = true;
+    const controller = new AbortController();
+
+    const syncSession = async () => {
+      try {
+        const response = await fetch(`/api/isaac/sessions/${isaacSession.sessionId}`, {
+          method: "GET",
+          signal: controller.signal,
+          cache: "no-store"
+        });
+        const payload = await readJson(response);
+        if (!response.ok) {
+          throw new Error(readApiError(payload, "Isaac session status could not be loaded."));
+        }
+
+        const session = payload as IsaacSessionInfo;
+        if (!active) {
+          return;
+        }
+
+        setIsaacSession(session);
+        setIsaacSessionStatus(resolveIsaacSessionStatus(session));
+        if (session.status === "error") {
+          setIsaacSessionError(session.statusMessage);
+        } else {
+          setIsaacSessionError(null);
+        }
+      } catch (nextError) {
+        if (!active || controller.signal.aborted) {
+          return;
+        }
+        setIsaacSessionStatus("error");
+        setIsaacSessionError(toMessage(nextError, "Isaac session status could not be loaded."));
+      }
+    };
+
+    void syncSession();
+    const timerId = window.setInterval(() => {
+      void syncSession();
+    }, ISAAC_STATUS_POLL_INTERVAL_MS);
+
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearInterval(timerId);
+    };
+  }, [isaacSession?.sessionId, isaacSession?.status]);
 
   useEffect(() => {
     if (!isaacSession?.sessionId) {
@@ -422,7 +481,7 @@ export default function RobotLab() {
   }, [isaacSession?.sessionId]);
 
   useEffect(() => {
-    if (!isaacSession?.wsUrl) {
+    if (!isaacSession?.wsUrl || isaacSession.status !== "ready") {
       return undefined;
     }
 
@@ -468,6 +527,18 @@ export default function RobotLab() {
           return;
         }
         if (message.type === "stage_error") {
+          setIsaacSessionStatus("error");
+          setIsaacSession((current) =>
+            current
+              ? {
+                  ...current,
+                  status: "error",
+                  phase: "error",
+                  statusMessage: message.message,
+                  updatedAt: new Date().toISOString()
+                }
+              : current
+          );
           setIsaacConnectionStatus("error");
           setIsaacSessionError(message.message);
         }
@@ -480,7 +551,7 @@ export default function RobotLab() {
       active = false;
       socket.close();
     };
-  }, [isaacSession?.wsUrl]);
+  }, [isaacSession?.status, isaacSession?.wsUrl]);
 
   async function loadMujocoSample() {
     setIsBusy(true);
@@ -547,13 +618,9 @@ export default function RobotLab() {
     <main className="lab-shell">
       <section className="hero-card">
         <div className="hero-copy">
-          <p className="eyebrow">robot-up2 / task 02</p>
+          <p className="eyebrow">robot-up2 / task 03</p>
           <h1>Dual Runtime Router</h1>
-          <p className="hero-text">
-            Upload a MuJoCo XML bundle or an Isaac USD stage. The app now
-            forks backend runtime bridges for both branches and keeps the
-            browser preview synchronized over websocket sessions.
-          </p>
+          <p className="hero-inline-note">MuJoCo + Isaac live runtime preview.</p>
         </div>
 
         <div className="hero-actions">
@@ -610,11 +677,11 @@ export default function RobotLab() {
         }}
       >
         <div>
-          <p className="dropzone-title">Drop `.xml`, `.mjcf`, `.usda`, `.usd`, `.usdc`, or `.zip` here</p>
+          <p className="dropzone-title">Drop `.xml`, `.mjcf`, `.urdf`, `.usda`, `.usd`, `.usdc`, or `.zip` here</p>
           <p className="dropzone-text">
             MuJoCo assets stream live pose frames; Isaac assets stream stage
-            hierarchy and transform updates from a headless `env_isaaclab`
-            session.
+            hierarchy, renderable geometry, and transform updates from a
+            headless `env_isaaclab` session.
           </p>
         </div>
         <button
@@ -657,7 +724,19 @@ export default function RobotLab() {
               frame={mujocoFrame}
             />
           ) : currentRuntime === "isaacsim" ? (
-            <IsaacStagePreview manifest={isaacManifest} frame={isaacFrame} />
+            isaacManifest ? (
+              <IsaacStagePreview
+                manifest={isaacManifest}
+                frame={isaacFrame}
+                assetBaseUrl={isaacSession?.assetBaseUrl || null}
+              />
+            ) : (
+              <IsaacPreviewState
+                session={isaacSession}
+                sessionStatus={isaacSessionStatus}
+                error={isaacSessionError}
+              />
+            )
           ) : (
             <EmptyPreviewState />
           )}
@@ -729,7 +808,7 @@ export default function RobotLab() {
           analysis.runtimeCandidates.isaacsim.length > 1 ? (
             <div className="entry-selector">
               <label className="entry-selector-label" htmlFor="isaac-entry-select">
-                Isaac Stage
+                Isaac Asset
               </label>
               <select
                 id="isaac-entry-select"
@@ -784,7 +863,7 @@ export default function RobotLab() {
           <div className="panel-header">
             <div>
               <p className="panel-kicker">Details</p>
-              <h2>{currentRuntime === "mujoco" ? "MJCF Summary" : "USD Stage Summary"}</h2>
+              <h2>{currentRuntime === "mujoco" ? "MJCF Summary" : "Isaac Asset Summary"}</h2>
             </div>
           </div>
 
@@ -799,6 +878,7 @@ export default function RobotLab() {
             <IsaacStageSummary
               preview={currentIsaacPreview}
               entry={currentEntry}
+              session={isaacSession}
               manifest={isaacManifest}
               connectionStatus={isaacConnectionStatus}
             />
@@ -878,20 +958,24 @@ function MjcfSummary({
 function IsaacStageSummary({
   preview,
   entry,
+  session,
   manifest,
   connectionStatus
 }: {
   preview: string | null;
   entry: AssetFileEntry | null;
+  session: IsaacSessionInfo | null;
   manifest: IsaacStageManifestMessage | null;
   connectionStatus: ConnectionStatus;
 }) {
   return (
     <>
       <dl className="stats-grid">
-        <Stat label="Stage" value={entry?.path || "--"} />
+        <Stat label="Asset" value={entry?.path || "--"} />
         <Stat label="Prims" value={String(manifest?.prim_count ?? 0)} />
         <Stat label="Geometry" value={String(manifest?.geometry_count ?? 0)} />
+        <Stat label="Renderable" value={String(manifest?.renderable_count ?? 0)} />
+        <Stat label="Mesh Prims" value={String(manifest?.mesh_prim_count ?? 0)} />
         <Stat label="Up Axis" value={manifest?.up_axis || "--"} />
         <Stat
           label="Meters / Unit"
@@ -905,12 +989,19 @@ function IsaacStageSummary({
       </dl>
 
       <p className="muted-line">Source entry: {entry?.path || "--"}</p>
+      {session ? <p className="muted-line">Bridge status: {session.statusMessage}</p> : null}
       {manifest?.default_prim ? (
         <p className="muted-line">Default prim: {manifest.default_prim}</p>
       ) : null}
+      {session?.recentLogs.length ? (
+        <div className="code-card">
+          <p className="code-card-title">Recent Bridge Logs</p>
+          <pre>{session.recentLogs.join("\n")}</pre>
+        </div>
+      ) : null}
       <div className="code-card">
-        <p className="code-card-title">USD Preview</p>
-        <pre>{preview || "Text preview unavailable for this USD stage."}</pre>
+        <p className="code-card-title">Asset Preview</p>
+        <pre>{preview || "Text preview unavailable for this Isaac asset."}</pre>
       </div>
     </>
   );
@@ -945,6 +1036,10 @@ function IsaacRuntimeCard({
           <dd>{connectionStatus}</dd>
         </div>
         <div>
+          <dt>Phase</dt>
+          <dd>{session?.phase || "--"}</dd>
+        </div>
+        <div>
           <dt>Session</dt>
           <dd>{session?.sessionId || "--"}</dd>
         </div>
@@ -958,11 +1053,20 @@ function IsaacRuntimeCard({
         </div>
       </dl>
 
+      {session ? <p className="muted-line">{session.statusMessage}</p> : null}
       {session?.wsUrl ? <p className="muted-line">WS: {session.wsUrl}</p> : null}
+      {session?.readyAt ? <p className="muted-line">Ready at: {session.readyAt}</p> : null}
       {manifest ? (
         <p className="muted-line">
-          Default prim: {manifest.default_prim || "--"} / geometry: {manifest.geometry_count}
+          Default prim: {manifest.default_prim || "--"} / geometry: {manifest.geometry_count} /
+          renderable: {manifest.renderable_count} / meshes: {manifest.mesh_prim_count}
         </p>
+      ) : null}
+      {session?.recentLogs.length ? (
+        <div className="code-card">
+          <p className="code-card-title">Recent Bridge Logs</p>
+          <pre>{session.recentLogs.join("\n")}</pre>
+        </div>
       ) : null}
       {error ? <p className="error-callout runtime-error">{error}</p> : null}
     </div>
@@ -1017,6 +1121,44 @@ function MujocoRuntimeCard({
   );
 }
 
+function IsaacPreviewState({
+  session,
+  sessionStatus,
+  error
+}: {
+  session: IsaacSessionInfo | null;
+  sessionStatus: SessionStatus;
+  error: string | null;
+}) {
+  const title =
+    sessionStatus === "starting"
+      ? "Isaac Sim is booting"
+      : sessionStatus === "error"
+        ? "Isaac Sim startup failed"
+        : "Awaiting Isaac stage manifest";
+  const message =
+    error ||
+    session?.statusMessage ||
+    "The Isaac session has been created and is waiting for the bridge to report progress.";
+
+  return (
+    <div className="empty-preview">
+      <p className="panel-kicker">Isaac Startup</p>
+      <h3>{title}</h3>
+      <p className="hero-text">{message}</p>
+      {session?.selectedEntryPath ? (
+        <p className="hero-text">Asset: {session.selectedEntryPath}</p>
+      ) : null}
+      {session?.recentLogs.length ? (
+        <div className="code-card">
+          <p className="code-card-title">Recent Bridge Logs</p>
+          <pre>{session.recentLogs.join("\n")}</pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function EmptyPreviewState() {
   return (
     <div className="empty-preview">
@@ -1058,6 +1200,16 @@ function formatBytes(size: number): string {
     return `${(size / 1024).toFixed(1)} KB`;
   }
   return `${(size / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function resolveIsaacSessionStatus(session: IsaacSessionInfo): SessionStatus {
+  if (session.status === "ready") {
+    return "ready";
+  }
+  if (session.status === "error") {
+    return "error";
+  }
+  return "starting";
 }
 
 function readApiError(payload: unknown, fallback: string): string {

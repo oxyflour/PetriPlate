@@ -7,5 +7,6 @@ tmp/
 .next/
 .vscode/
 .runtime/
+.codex-artifacts/
 *.tsbuildinfo
 packages/robot-up2/.runtime/

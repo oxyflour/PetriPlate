@@ -26,11 +26,13 @@ const RELEVANT_EXTENSIONS = new Set([
   "usda",
   "usd",
   "usdc",
+  "urdf",
   "obj",
   "stl",
   "msh"
 ]);
 const ISAAC_STAGE_EXTENSIONS = new Set(["usda", "usd", "usdc"]);
+const ISAAC_URDF_EXTENSIONS = new Set(["urdf"]);
 const MESH_EXTENSIONS = new Set(["obj", "stl", "msh"]);
 
 export async function createSampleAssetAnalysis(): Promise<AssetAnalysis> {
@@ -147,6 +149,24 @@ export async function createAssetAnalysisFromFile(file: File): Promise<AssetAnal
     });
   }
 
+  if (ISAAC_URDF_EXTENSIONS.has(extension)) {
+    const text = await file.text();
+    return buildAnalysis({
+      sourceName: file.name,
+      sourceKind: "upload",
+      entries: [
+        {
+          path: normalizePath(file.name),
+          size: file.size,
+          extension,
+          kind: "isaac-urdf",
+          text,
+          blob: file
+        }
+      ]
+    });
+  }
+
   const text = await file.text();
   return buildAnalysis({
     sourceName: file.name,
@@ -220,16 +240,16 @@ export function resolveIsaacEntrySelection(
   entry: AssetFileEntry | null;
   preview: string | null;
 } {
-  const usdCandidates = entries.filter((entry) => entry.kind === "isaac-stage");
-  const fallbackEntry = usdCandidates[0] || null;
+  const isaacCandidates = [...entries.filter(isIsaacEntry)].sort(compareIsaacEntries);
+  const fallbackEntry = isaacCandidates[0] || null;
   const selectedEntry =
     (selectedEntryPath
-      ? usdCandidates.find((entry) => entry.path === selectedEntryPath) || null
+      ? isaacCandidates.find((entry) => entry.path === selectedEntryPath) || null
       : null) || fallbackEntry;
 
   return {
     entry: selectedEntry,
-    preview: selectedEntry?.text ? createUsdaPreview(selectedEntry.text) : null
+    preview: selectedEntry?.text ? createTextPreview(selectedEntry.text) : null
   };
 }
 
@@ -275,6 +295,18 @@ async function readRelevantZipEntries(buffer: ArrayBuffer): Promise<AssetFileEnt
       continue;
     }
 
+    if (ISAAC_URDF_EXTENSIONS.has(extension)) {
+      const text = await zipEntry.async("text");
+      entries.push({
+        path,
+        size: new TextEncoder().encode(text).byteLength,
+        extension,
+        kind: "isaac-urdf",
+        text
+      });
+      continue;
+    }
+
     const text = await zipEntry.async("text");
     entries.push({
       path,
@@ -297,7 +329,7 @@ function buildAnalysis(input: {
   const runtimeCandidates: Partial<Record<RuntimeKind, AssetFileEntry[]>> = {};
   const warnings: string[] = [];
   const mujocoCandidates = input.entries.filter((entry) => entry.kind === "mujoco-xml");
-  const isaacCandidates = input.entries.filter((entry) => entry.kind === "isaac-stage");
+  const isaacCandidates = [...input.entries.filter(isIsaacEntry)].sort(compareIsaacEntries);
   const mujocoEntry = mujocoCandidates[0] || null;
   const isaacEntry = isaacCandidates[0] || null;
 
@@ -331,16 +363,16 @@ function buildAnalysis(input: {
   }
   if (isaacCandidates.length > 1) {
     warnings.push(
-      `Detected ${isaacCandidates.length} Isaac USD candidates. Pick the desired stage below.`
+      `Detected ${isaacCandidates.length} Isaac USD/URDF candidates. Pick the desired asset below.`
     );
   }
   if (!defaultRuntime) {
-    warnings.push("No MuJoCo XML or USD stage was found in the selected asset.");
+    warnings.push("No MuJoCo XML, Isaac USD stage, or URDF asset was found in the selected asset.");
   }
 
   const defaultMujocoSelection = resolveMujocoEntrySelection(input.entries, mujocoEntry?.path || null);
 
-  const isaacPreview = isaacEntry?.text ? createUsdaPreview(isaacEntry.text) : null;
+  const isaacPreview = isaacEntry?.text ? createTextPreview(isaacEntry.text) : null;
 
   return {
     sourceName: input.sourceName,
@@ -368,6 +400,10 @@ function classifyEntryKind(path: string, text?: string): AssetEntryKind {
     return "isaac-stage";
   }
 
+  if (ISAAC_URDF_EXTENSIONS.has(extension) || /<robot[\s>]/i.test(trimmed)) {
+    return "isaac-urdf";
+  }
+
   if (MESH_EXTENSIONS.has(extension)) {
     return "mesh";
   }
@@ -375,12 +411,41 @@ function classifyEntryKind(path: string, text?: string): AssetEntryKind {
   return "other";
 }
 
-function createUsdaPreview(source: string): string {
+function createTextPreview(source: string): string {
   return source
     .split(/\r?\n/)
     .slice(0, 40)
     .join("\n")
     .trim();
+}
+
+function isIsaacEntry(entry: AssetFileEntry) {
+  return entry.kind === "isaac-stage" || entry.kind === "isaac-urdf";
+}
+
+function compareIsaacEntries(left: AssetFileEntry, right: AssetFileEntry) {
+  const leftWeight = isaacEntryPriority(left.extension);
+  const rightWeight = isaacEntryPriority(right.extension);
+  if (leftWeight !== rightWeight) {
+    return leftWeight - rightWeight;
+  }
+  return left.path.localeCompare(right.path);
+}
+
+function isaacEntryPriority(extension: string) {
+  if (extension === "usda") {
+    return 0;
+  }
+  if (extension === "usd") {
+    return 1;
+  }
+  if (extension === "usdc") {
+    return 2;
+  }
+  if (extension === "urdf") {
+    return 3;
+  }
+  return 4;
 }
 
 function createObjectUrl(blob: Blob): string {

@@ -1,15 +1,26 @@
 import type * as THREE from "three";
 
-export type PhoneSeamPosition = "top" | "left" | "right" | "bottom";
+export type PhoneFrameFeaturePosition = "top" | "left" | "right" | "bottom";
+
+export type PhoneSeamPosition = PhoneFrameFeaturePosition;
+export type PhoneRibPosition = PhoneFrameFeaturePosition;
+
+export type PhoneFrameFeature = {
+  width: number;
+  position: PhoneFrameFeaturePosition;
+  distance: number;
+};
+
+export type PhoneRibFeature = PhoneFrameFeature & {
+  thickness: number;
+  offset: number;
+};
 
 export type PhoneConfig = {
   frame: {
     thickness: number;
-    seams: Array<{
-      width: number;
-      position: PhoneSeamPosition;
-      distance: number;
-    }>;
+    seams: PhoneFrameFeature[];
+    ribs: PhoneRibFeature[];
   };
 };
 
@@ -53,8 +64,13 @@ export type ManifoldRuntime = {
     triVerts: Uint32Array;
     vertProperties: Float32Array;
   }) => unknown;
-  Manifold: new (mesh: unknown) => ManifoldInstance;
+  Manifold: ManifoldStatic;
   CrossSection: CrossSectionStatic;
+};
+
+export type ManifoldStatic = {
+  new (mesh: unknown): ManifoldInstance;
+  union: (manifolds: ManifoldInstance[]) => ManifoldInstance;
 };
 
 export type ManifoldInstance = {
@@ -80,6 +96,10 @@ export type CrossSectionStatic = {
 
 export type CrossSectionInstance = {
   add: (other: CrossSectionInstance) => CrossSectionInstance;
+  bounds: () => {
+    min: [number, number];
+    max: [number, number];
+  };
   delete?: () => void;
   extrude: (
     height: number,
@@ -89,6 +109,7 @@ export type CrossSectionInstance = {
     center?: boolean
   ) => ManifoldInstance;
   isEmpty: () => boolean;
+  intersect: (other: CrossSectionInstance) => CrossSectionInstance;
   numContour: () => number;
   offset: (delta: number) => CrossSectionInstance;
   simplify: (epsilon?: number) => CrossSectionInstance;

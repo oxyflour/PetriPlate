@@ -110,6 +110,29 @@ def Xform "World"
                 double3 xformOp:translate = (0.5, 0, 0.14)
                 uniform token[] xformOpOrder = ["xformOp:translate"]
             }
+
+            def Mesh "Guard"
+            {
+                int[] faceVertexCounts = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+                int[] faceVertexIndices = [
+                    0, 1, 2, 0, 2, 3,
+                    4, 6, 5, 4, 7, 6,
+                    0, 4, 5, 0, 5, 1,
+                    1, 5, 6, 1, 6, 2,
+                    2, 6, 7, 2, 7, 3,
+                    3, 7, 4, 3, 4, 0
+                ]
+                point3f[] points = [
+                    (-0.16, -0.10, -0.05), (0.16, -0.10, -0.05),
+                    (0.16, 0.10, -0.05), (-0.16, 0.10, -0.05),
+                    (-0.16, -0.10, 0.05), (0.16, -0.10, 0.05),
+                    (0.16, 0.10, 0.05), (-0.16, 0.10, 0.05)
+                ]
+                uniform token subdivisionScheme = "none"
+                double3 xformOp:translate = (0.2, 0.18, 0.34)
+                double3 xformOp:rotateXYZ = (18, 0, -16)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            }
         }
     }
 

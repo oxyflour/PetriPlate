@@ -19,7 +19,9 @@ import type {
   LogEntry,
   ParsedPhoneConfig,
   PhoneConfig,
-  PhoneSeamPosition,
+  PhoneFrameFeature,
+  PhoneFrameFeaturePosition,
+  PhoneRibFeature,
   SourceModel
 } from "../lib/types";
 import PhonePreview from "../components/phone-preview";
@@ -126,12 +128,12 @@ export default function AntennaStudio() {
     ];
   }, [preview, sourceModel]);
 
-  const seamHint = useMemo(() => {
+  const frameFeatureHint = useMemo(() => {
     const parsed = parsePhoneConfig(deferredEditorValue);
     if (!parsed.ok) {
-      return "distance is measured from the midpoint of the selected edge.";
+      return "distance is measured from the midpoint of the selected edge. rib.thickness controls z thickness and rib.offset shifts it along z.";
     }
-    return describeSeams(parsed.value.frame.seams);
+    return describeFrameFeatures(parsed.value.frame.seams, parsed.value.frame.ribs);
   }, [deferredEditorValue]);
 
   return (
@@ -155,7 +157,7 @@ export default function AntennaStudio() {
             <div className="toolbar-copy">
               <p className="panel-label">Input</p>
               <strong>JSON + folder upload</strong>
-              <span>{seamHint}</span>
+              <span>{frameFeatureHint}</span>
             </div>
             <div className="toolbar-actions">
               <button
@@ -255,6 +257,10 @@ export default function AntennaStudio() {
                 <i className="legend-chip seam" />
                 Seam cuts baked into the shell
               </span>
+              <span>
+                <i className="legend-chip rib" />
+                Ribs are unioned into the frame shell
+              </span>
             </div>
           </div>
         </section>
@@ -310,23 +316,14 @@ function parsePhoneConfig(source: string): ParsedPhoneConfig {
       return { ok: false, error: "frame.seams must be an array" };
     }
 
-    const normalizedSeams = seams.map((candidate, index) => {
-      if (
-        !candidate ||
-        !Number.isFinite(candidate.width) ||
-        candidate.width <= 0 ||
-        !Number.isFinite(candidate.distance) ||
-        !isPhoneSeamPosition(candidate.position)
-      ) {
-        throw new Error(`Invalid seam at index ${index}`);
-      }
+    const normalizedSeams = normalizeSeams(seams);
 
-      return {
-        width: candidate.width,
-        distance: candidate.distance,
-        position: candidate.position
-      };
-    });
+    const ribs = raw.frame?.ribs;
+    if (ribs !== undefined && !Array.isArray(ribs)) {
+      return { ok: false, error: "frame.ribs must be an array when provided" };
+    }
+
+    const normalizedRibs = normalizeRibs(ribs ?? []);
 
     const normalizedThickness = Number(thickness);
 
@@ -335,7 +332,8 @@ function parsePhoneConfig(source: string): ParsedPhoneConfig {
       value: {
         frame: {
           thickness: normalizedThickness,
-          seams: normalizedSeams
+          seams: normalizedSeams,
+          ribs: normalizedRibs
         }
       }
     };
@@ -347,7 +345,75 @@ function parsePhoneConfig(source: string): ParsedPhoneConfig {
   }
 }
 
-function isPhoneSeamPosition(value: unknown): value is PhoneSeamPosition {
+function normalizeSeams(candidates: unknown[]): PhoneFrameFeature[] {
+  return candidates.map((candidate, index) => {
+    const feature = candidate as Partial<PhoneFrameFeature> | null;
+    const width = feature?.width;
+    const distance = feature?.distance;
+    const position = feature?.position;
+    if (
+      !feature ||
+      typeof width !== "number" ||
+      !Number.isFinite(width) ||
+      width <= 0 ||
+      typeof distance !== "number" ||
+      !Number.isFinite(distance) ||
+      !isPhoneFrameFeaturePosition(position)
+    ) {
+      throw new Error(`Invalid seam at index ${index}`);
+    }
+
+    return {
+      width: Number(width),
+      distance: Number(distance),
+      position
+    };
+  });
+}
+
+function normalizeRibs(candidates: unknown[]): PhoneRibFeature[] {
+  return candidates.map((candidate, index) => {
+    const feature = candidate as (Partial<PhoneRibFeature> & {
+      thickeness?: unknown;
+    }) | null;
+    const width = feature?.width;
+    const distance = feature?.distance;
+    const position = feature?.position;
+    const thickness =
+      typeof feature?.thickness === "number"
+        ? feature.thickness
+        : typeof feature?.thickeness === "number"
+          ? feature.thickeness
+          : undefined;
+    const offset = typeof feature?.offset === "number" ? feature.offset : 0;
+
+    if (
+      !feature ||
+      typeof width !== "number" ||
+      !Number.isFinite(width) ||
+      width <= 0 ||
+      typeof distance !== "number" ||
+      !Number.isFinite(distance) ||
+      !isPhoneFrameFeaturePosition(position) ||
+      typeof thickness !== "number" ||
+      !Number.isFinite(thickness) ||
+      thickness <= 0 ||
+      !Number.isFinite(offset)
+    ) {
+      throw new Error(`Invalid rib at index ${index}`);
+    }
+
+    return {
+      width: Number(width),
+      distance: Number(distance),
+      position,
+      thickness: Number(thickness),
+      offset: Number(offset)
+    };
+  });
+}
+
+function isPhoneFrameFeaturePosition(value: unknown): value is PhoneFrameFeaturePosition {
   return value === "top" || value === "left" || value === "right" || value === "bottom";
 }
 
@@ -368,11 +434,14 @@ function pushLog(
   setLogs((current) => [createLog(level, message), ...current].slice(0, MAX_LOGS));
 }
 
-function describeSeams(seams: PhoneConfig["frame"]["seams"]) {
-  if (seams.length === 0) {
-    return "No seam cuts configured. distance is measured from the edge midpoint.";
+function describeFrameFeatures(
+  seams: PhoneConfig["frame"]["seams"],
+  ribs: PhoneConfig["frame"]["ribs"]
+) {
+  if (seams.length === 0 && ribs.length === 0) {
+    return "No seams or ribs configured. distance is measured from the edge midpoint. rib.thickness controls z thickness and rib.offset shifts it along z.";
   }
-  return `Configured ${seams.length} seam cuts. distance is measured from the edge midpoint.`;
+  return `Configured ${seams.length} seam cuts and ${ribs.length} ribs. distance is measured from the edge midpoint. rib.thickness controls z thickness and rib.offset shifts it along z.`;
 }
 
 function formatNumber(value: number) {

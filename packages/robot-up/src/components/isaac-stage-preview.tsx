@@ -3,10 +3,15 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { ColladaLoader } from "three/examples/jsm/loaders/ColladaLoader.js";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import type {
   IsaacStageFrameMessage,
   IsaacStageManifestMessage,
   IsaacStagePrim,
+  IsaacStageRenderable,
+  IsaacStageRenderableAxis,
   Quat,
   Vec3
 } from "../lib/types";
@@ -14,11 +19,13 @@ import type {
 type IsaacStagePreviewProps = {
   manifest: IsaacStageManifestMessage | null;
   frame: IsaacStageFrameMessage | null;
+  assetBaseUrl: string | null;
 };
 
 export default function IsaacStagePreview({
   manifest,
-  frame
+  frame,
+  assetBaseUrl
 }: IsaacStagePreviewProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -117,7 +124,6 @@ export default function IsaacStagePreview({
       return undefined;
     }
 
-    let cancelled = false;
     primNodesRef.current = new Map();
     clearGroup(stageRoot);
 
@@ -136,9 +142,9 @@ export default function IsaacStagePreview({
       applyTransform(node, prim.position, prim.quaternion, prim.scale);
       node.visible = prim.visible;
 
-      const placeholder = createPrimPlaceholder(prim);
-      if (placeholder) {
-        node.add(placeholder);
+      const renderableNode = createPrimRenderableNode(prim, assetBaseUrl);
+      if (renderableNode) {
+        node.add(renderableNode);
         fitTargets.push(node);
       }
 
@@ -158,21 +164,18 @@ export default function IsaacStagePreview({
       }
     }
 
-    if (!cancelled) {
-      primNodesRef.current = primNodes;
-      fitCamera(
-        cameraRef.current,
-        controlsRef.current,
-        fitTargets.length ? fitTargets : [...stageRoot.children]
-      );
-    }
+    primNodesRef.current = primNodes;
+    fitCamera(
+      cameraRef.current,
+      controlsRef.current,
+      fitTargets.length ? fitTargets : [...stageRoot.children]
+    );
 
     return () => {
-      cancelled = true;
       primNodesRef.current = new Map();
       clearGroup(stageRoot);
     };
-  }, [manifest]);
+  }, [assetBaseUrl, manifest]);
 
   useEffect(() => {
     if (!frame?.prims.length) {
@@ -195,6 +198,258 @@ export default function IsaacStagePreview({
   }, [frame]);
 
   return <div className="preview-canvas" ref={mountRef} />;
+}
+
+function createPrimRenderableNode(prim: IsaacStagePrim, assetBaseUrl: string | null) {
+  if (prim.renderable) {
+    return createRenderableNode(prim.renderable, prim, assetBaseUrl);
+  }
+  return createPrimPlaceholder(prim);
+}
+
+function createRenderableNode(
+  renderable: IsaacStageRenderable,
+  prim: IsaacStagePrim,
+  assetBaseUrl: string | null
+): THREE.Object3D | null {
+  const color = pickPrimColor(prim.type);
+
+  if (renderable.kind === "mesh") {
+    return createMeshNode(renderable, color);
+  }
+
+  if (renderable.kind === "asset_mesh") {
+    return createAssetMeshNode(renderable, color, assetBaseUrl);
+  }
+
+  const material = new THREE.MeshStandardMaterial({
+    color,
+    roughness: 0.52,
+    metalness: 0.14
+  });
+
+  let mesh: THREE.Mesh;
+  if (renderable.kind === "box") {
+    mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        Math.max(renderable.size.x, 0.001),
+        Math.max(renderable.size.y, 0.001),
+        Math.max(renderable.size.z, 0.001)
+      ),
+      material
+    );
+  } else if (renderable.kind === "cube") {
+    mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        Math.max(renderable.size, 0.001),
+        Math.max(renderable.size, 0.001),
+        Math.max(renderable.size, 0.001)
+      ),
+      material
+    );
+  } else if (renderable.kind === "sphere") {
+    mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(Math.max(renderable.radius, 0.001), 32, 24),
+      material
+    );
+  } else if (renderable.kind === "capsule") {
+    mesh = new THREE.Mesh(
+      new THREE.CapsuleGeometry(
+        Math.max(renderable.radius, 0.001),
+        Math.max(renderable.height, 0.001),
+        12,
+        24
+      ),
+      material
+    );
+    applyAxisOrientation(mesh, renderable.axis);
+  } else if (renderable.kind === "cylinder") {
+    mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(
+        Math.max(renderable.radius, 0.001),
+        Math.max(renderable.radius, 0.001),
+        Math.max(renderable.height, 0.001),
+        32
+      ),
+      material
+    );
+    applyAxisOrientation(mesh, renderable.axis);
+  } else if (renderable.kind === "cone") {
+    mesh = new THREE.Mesh(
+      new THREE.ConeGeometry(
+        Math.max(renderable.radius, 0.001),
+        Math.max(renderable.height, 0.001),
+        32
+      ),
+      material
+    );
+    applyAxisOrientation(mesh, renderable.axis);
+  } else {
+    material.dispose();
+    return null;
+  }
+
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return mesh;
+}
+
+function createMeshNode(
+  renderable: Extract<IsaacStageRenderable, { kind: "mesh" }>,
+  color: string
+) {
+  if (
+    renderable.positions.length < 9 ||
+    renderable.positions.length % 3 !== 0 ||
+    renderable.indices.length < 3
+  ) {
+    return null;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(renderable.positions, 3)
+  );
+  geometry.setIndex(renderable.indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshStandardMaterial({
+      color,
+      roughness: 0.46,
+      metalness: 0.18,
+      side: renderable.doubleSided ? THREE.DoubleSide : THREE.FrontSide
+    })
+  );
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+function createAssetMeshNode(
+  renderable: Extract<IsaacStageRenderable, { kind: "asset_mesh" }>,
+  color: string,
+  assetBaseUrl: string | null
+) {
+  const root = new THREE.Group();
+  if (!assetBaseUrl) {
+    return root;
+  }
+
+  const placeholder = new THREE.Mesh(
+    new THREE.BoxGeometry(0.08, 0.08, 0.08),
+    new THREE.MeshStandardMaterial({
+      color,
+      transparent: true,
+      opacity: 0.18,
+      roughness: 0.5,
+      metalness: 0.08
+    })
+  );
+  root.add(placeholder);
+
+  const assetUrl = `${assetBaseUrl}/${encodeAssetPath(renderable.assetPath)}`;
+
+  if (renderable.format === "stl") {
+    new STLLoader().load(
+      assetUrl,
+      (geometry) => {
+        root.remove(placeholder);
+        placeholder.geometry.dispose();
+        if (Array.isArray(placeholder.material)) {
+          placeholder.material.forEach((material) => material.dispose());
+        } else {
+          placeholder.material.dispose();
+        }
+
+        geometry.computeVertexNormals();
+        const mesh = new THREE.Mesh(
+          geometry,
+          new THREE.MeshStandardMaterial({
+            color,
+            roughness: 0.46,
+            metalness: 0.18
+          })
+        );
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        root.add(mesh);
+      },
+      undefined,
+      () => undefined
+    );
+    return root;
+  }
+
+  if (renderable.format === "obj") {
+    new OBJLoader().load(
+      assetUrl,
+      (object) => {
+        root.remove(placeholder);
+        placeholder.geometry.dispose();
+        if (Array.isArray(placeholder.material)) {
+          placeholder.material.forEach((material) => material.dispose());
+        } else {
+          placeholder.material.dispose();
+        }
+        object.traverse((child) => {
+          const mesh = child as THREE.Mesh;
+          if (!mesh.isMesh) {
+            return;
+          }
+          mesh.material = new THREE.MeshStandardMaterial({
+            color,
+            roughness: 0.46,
+            metalness: 0.18
+          });
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+        });
+        root.add(object);
+      },
+      undefined,
+      () => undefined
+    );
+    return root;
+  }
+
+  new ColladaLoader().load(
+    assetUrl,
+    (result) => {
+      root.remove(placeholder);
+      placeholder.geometry.dispose();
+      if (Array.isArray(placeholder.material)) {
+        placeholder.material.forEach((material) => material.dispose());
+      } else {
+        placeholder.material.dispose();
+      }
+      result.scene.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh) {
+          return;
+        }
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+      });
+      root.add(result.scene);
+    },
+    undefined,
+    () => undefined
+  );
+
+  return root;
+}
+
+function encodeAssetPath(assetPath: string) {
+  return assetPath
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
 function createPrimPlaceholder(prim: IsaacStagePrim) {
@@ -241,6 +496,16 @@ function createPrimPlaceholder(prim: IsaacStagePrim) {
 
   root.add(solid, edges);
   return root;
+}
+
+function applyAxisOrientation(target: THREE.Object3D, axis: IsaacStageRenderableAxis) {
+  if (axis === "X") {
+    target.rotation.z = -Math.PI / 2;
+    return;
+  }
+  if (axis === "Z") {
+    target.rotation.x = Math.PI / 2;
+  }
 }
 
 function pickPrimColor(type: string) {

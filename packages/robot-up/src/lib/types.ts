@@ -1,6 +1,11 @@
 export type RuntimeKind = "mujoco" | "isaacsim";
 
-export type AssetEntryKind = "mujoco-xml" | "isaac-stage" | "mesh" | "other";
+export type AssetEntryKind =
+  | "mujoco-xml"
+  | "isaac-stage"
+  | "isaac-urdf"
+  | "mesh"
+  | "other";
 
 export type AssetFileEntry = {
   path: string;
@@ -103,7 +108,71 @@ export type IsaacStagePrim = {
   scale: Vec3;
   bboxMin: Vec3;
   bboxMax: Vec3;
+  renderable: IsaacStageRenderable | null;
 };
+
+export type IsaacStageRenderableAxis = "X" | "Y" | "Z";
+
+export type IsaacStageMeshRenderable = {
+  kind: "mesh";
+  positions: number[];
+  indices: number[];
+  doubleSided: boolean;
+};
+
+export type IsaacStageAssetMeshFormat = "dae" | "stl" | "obj";
+
+export type IsaacStageAssetMeshRenderable = {
+  kind: "asset_mesh";
+  assetPath: string;
+  format: IsaacStageAssetMeshFormat;
+};
+
+export type IsaacStageBoxRenderable = {
+  kind: "box";
+  size: Vec3;
+};
+
+export type IsaacStageCubeRenderable = {
+  kind: "cube";
+  size: number;
+};
+
+export type IsaacStageSphereRenderable = {
+  kind: "sphere";
+  radius: number;
+};
+
+export type IsaacStageCapsuleRenderable = {
+  kind: "capsule";
+  radius: number;
+  height: number;
+  axis: IsaacStageRenderableAxis;
+};
+
+export type IsaacStageCylinderRenderable = {
+  kind: "cylinder";
+  radius: number;
+  height: number;
+  axis: IsaacStageRenderableAxis;
+};
+
+export type IsaacStageConeRenderable = {
+  kind: "cone";
+  radius: number;
+  height: number;
+  axis: IsaacStageRenderableAxis;
+};
+
+export type IsaacStageRenderable =
+  | IsaacStageMeshRenderable
+  | IsaacStageAssetMeshRenderable
+  | IsaacStageBoxRenderable
+  | IsaacStageCubeRenderable
+  | IsaacStageSphereRenderable
+  | IsaacStageCapsuleRenderable
+  | IsaacStageCylinderRenderable
+  | IsaacStageConeRenderable;
 
 export type IsaacStageFramePrim = {
   path: string;
@@ -127,6 +196,8 @@ export type IsaacStageManifestMessage = {
   active_time_code: number;
   prim_count: number;
   geometry_count: number;
+  renderable_count: number;
+  mesh_prim_count: number;
   prims: IsaacStagePrim[];
 };
 
@@ -151,12 +222,29 @@ export type IsaacBridgeMessage =
   | IsaacStageFrameMessage
   | IsaacStageErrorMessage;
 
+export type IsaacSessionStatus = "starting" | "ready" | "error";
+
+export type IsaacSessionPhase =
+  | "launching"
+  | "waiting_runtime"
+  | "loading_stage"
+  | "starting_websocket"
+  | "ready"
+  | "error";
+
 export type IsaacSessionInfo = {
   sessionId: string;
   wsUrl: string;
   assetBaseUrl: string;
   selectedEntryPath: string;
   expiresAt: string;
+  status: IsaacSessionStatus;
+  phase: IsaacSessionPhase;
+  statusMessage: string;
+  recentLogs: string[];
+  createdAt: string;
+  updatedAt: string;
+  readyAt: string | null;
 };
 
 export type MujocoManifestBody = {

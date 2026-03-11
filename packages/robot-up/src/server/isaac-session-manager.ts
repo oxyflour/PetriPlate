@@ -7,7 +7,11 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import type { Readable } from "node:stream";
 import JSZip from "jszip";
-import type { IsaacSessionInfo } from "../lib/types";
+import type {
+  IsaacSessionInfo,
+  IsaacSessionPhase,
+  IsaacSessionStatus
+} from "../lib/types";
 
 const PACKAGE_ROOT = process.cwd();
 const SESSION_ROOT = path.join(PACKAGE_ROOT, ".runtime", "isaac-sessions");
@@ -17,9 +21,11 @@ const SWEEP_INTERVAL_MS = 15_000;
 const BRIDGE_READY_TIMEOUT_MS = 90_000;
 const BRIDGE_READY_POLL_MS = 300;
 const MAX_LOG_LINES = 240;
+const RECENT_LOG_LIMIT = 12;
 const CONDA_ENV_NAME = process.env.ROBOT_UP2_ISAAC_CONDA_ENV || "env_isaaclab";
 const CONDA_ENV_VAR_CANDIDATES = ["ROBOT_UP2_ISAAC_CONDA_EXE", "CONDA_EXE"] as const;
-const STAGE_EXTENSIONS = [".usda", ".usd", ".usdc"] as const;
+const USD_STAGE_EXTENSIONS = [".usda", ".usd", ".usdc"] as const;
+const URDF_EXTENSIONS = [".urdf"] as const;
 const CONDA_PATH_CANDIDATES = [
   path.join(process.env.USERPROFILE || "", "anaconda3", "Scripts", "conda.exe"),
   path.join(process.env.USERPROFILE || "", "miniconda3", "Scripts", "conda.exe"),
@@ -34,13 +40,21 @@ type ManagedSession = {
   workdir: string;
   assetDir: string;
   selectedEntryPath: string;
-  stagePath: string;
+  assetPath: string;
+  wsUrl: string;
+  assetBaseUrl: string;
   port: number;
   createdAt: number;
+  updatedAt: number;
   lastSeenAt: number;
   expiresAt: number;
+  readyAt: number | null;
+  status: IsaacSessionStatus;
+  phase: IsaacSessionPhase;
+  statusMessage: string;
   process: ChildProcessByStdio<null, Readable, Readable>;
   logs: string[];
+  startupPromise: Promise<void> | null;
   destroyPromise: Promise<void> | null;
   spawnError: Error | null;
 };
@@ -75,15 +89,16 @@ export class IsaacSessionManager {
 
     try {
       await writeUploadedAssetToDirectory(params.file, assetDir);
-      const selectedEntryPath = await resolveStageEntryPath(assetDir, params.entryPath);
-      const stagePath = path.join(assetDir, ...selectedEntryPath.split("/"));
+      const selectedEntryPath = await resolveIsaacEntryPath(assetDir, params.entryPath);
+      const assetPath = path.join(assetDir, ...selectedEntryPath.split("/"));
       const port = await allocatePort();
+      const wsUrl = buildBrowserWsUrl(params.requestHostname, port);
       const assetBaseUrl = `${params.origin}/api/isaac/sessions/${sessionId}/assets`;
       const condaExecutable = await resolveCondaExecutable();
       const child = spawnBridgeProcess({
         condaExecutable,
         port,
-        stagePath
+        assetPath
       });
 
       const session: ManagedSession = {
@@ -91,13 +106,21 @@ export class IsaacSessionManager {
         workdir,
         assetDir,
         selectedEntryPath,
-        stagePath,
+        assetPath,
+        wsUrl,
+        assetBaseUrl,
         port,
         createdAt: Date.now(),
+        updatedAt: Date.now(),
         lastSeenAt: Date.now(),
         expiresAt: Date.now() + DEFAULT_TTL_MS,
+        readyAt: null,
+        status: "starting",
+        phase: "launching",
+        statusMessage: buildInitialStatusMessage(selectedEntryPath),
         process: child,
         logs: [],
+        startupPromise: null,
         destroyPromise: null,
         spawnError: null
       };
@@ -105,20 +128,18 @@ export class IsaacSessionManager {
       this.sessions.set(sessionId, session);
       bindSessionLogging(session);
       bindSessionExitHandling(this, session);
+      session.startupPromise = this.startSession(session);
 
-      await waitForBridgeReady(session);
-
-      return {
-        sessionId,
-        wsUrl: buildBrowserWsUrl(params.requestHostname, port),
-        assetBaseUrl,
-        selectedEntryPath,
-        expiresAt: new Date(session.expiresAt).toISOString()
-      };
+      return toSessionInfo(session);
     } catch (error) {
       await fs.rm(workdir, { recursive: true, force: true });
       throw error;
     }
+  }
+
+  getSessionInfo(sessionId: string): IsaacSessionInfo | null {
+    const session = this.sessions.get(sessionId);
+    return session ? toSessionInfo(session) : null;
   }
 
   touchSession(sessionId: string): string | null {
@@ -191,12 +212,36 @@ export class IsaacSessionManager {
     clearInterval(this.sweepTimer);
     await Promise.all([...this.sessions.keys()].map((sessionId) => this.destroySession(sessionId)));
   }
+
+  private async startSession(session: ManagedSession): Promise<void> {
+    updateSessionProgress(
+      session,
+      "waiting_runtime",
+      buildRuntimeWaitMessage(session.selectedEntryPath)
+    );
+
+    try {
+      await waitForBridgeReady(session);
+      if (!this.sessions.has(session.id) || session.destroyPromise) {
+        return;
+      }
+      markSessionReady(session);
+    } catch (error) {
+      if (!this.sessions.has(session.id) || session.destroyPromise) {
+        return;
+      }
+      markSessionError(
+        session,
+        getErrorHeadline(error, "Isaac bridge could not be started.")
+      );
+    }
+  }
 }
 
 function spawnBridgeProcess(input: {
   condaExecutable: string;
   port: number;
-  stagePath: string;
+  assetPath: string;
 }) {
   return spawn(
     input.condaExecutable,
@@ -208,8 +253,8 @@ function spawnBridgeProcess(input: {
       "python",
       "-u",
       "sim/isaac_stage_bridge.py",
-      "--stage",
-      input.stagePath,
+      "--asset",
+      input.assetPath,
       "--host",
       "127.0.0.1",
       "--port",
@@ -228,22 +273,30 @@ function bindSessionLogging(session: ManagedSession) {
   session.process.stderr.setEncoding("utf8");
 
   session.process.stdout.on("data", (chunk: string) => {
-    appendLogLines(session.logs, `[stdout] ${chunk}`);
+    const lines = appendLogLines(session.logs, chunk, "stdout");
+    for (const line of lines) {
+      updateSessionFromBridgeLog(session, line);
+    }
   });
   session.process.stderr.on("data", (chunk: string) => {
-    appendLogLines(session.logs, `[stderr] ${chunk}`);
+    appendLogLines(session.logs, chunk, "stderr");
   });
   session.process.on("error", (error) => {
     session.spawnError = error instanceof Error ? error : new Error(String(error));
-    appendLogLines(session.logs, `[spawn] ${session.spawnError.message}`);
+    appendLogLines(session.logs, session.spawnError.message, "spawn");
+    markSessionError(session, session.spawnError.message);
   });
 }
 
 function bindSessionExitHandling(manager: IsaacSessionManager, session: ManagedSession) {
-  session.process.once("exit", () => {
-    if (!session.destroyPromise) {
-      void manager.destroySession(session.id);
+  session.process.once("exit", (code, signal) => {
+    if (session.destroyPromise || !manager.getSessionInfo(session.id)) {
+      return;
     }
+
+    const detail =
+      code !== null ? `code ${code}` : signal ? `signal ${signal}` : "an unknown reason";
+    markSessionError(session, `Isaac bridge exited with ${detail}.`);
   });
 }
 
@@ -353,42 +406,42 @@ async function extractZipToDirectory(buffer: Buffer, assetDir: string): Promise<
   }
 }
 
-async function resolveStageEntryPath(
+async function resolveIsaacEntryPath(
   assetDir: string,
   requestedEntryPath: string | null | undefined
 ): Promise<string> {
   if (requestedEntryPath) {
     const normalizedRequestedPath = normalizeRelativePath(requestedEntryPath);
     if (!normalizedRequestedPath) {
-      throw new Error("Selected Isaac stage path is invalid.");
+      throw new Error("Selected Isaac asset path is invalid.");
     }
     const requestedAbsolutePath = path.resolve(assetDir, ...normalizedRequestedPath.split("/"));
     if (!isPathInside(assetDir, requestedAbsolutePath)) {
-      throw new Error("Selected Isaac stage path is invalid.");
+      throw new Error("Selected Isaac asset path is invalid.");
     }
-    if (!(await looksLikeUsdStage(requestedAbsolutePath, normalizedRequestedPath))) {
-      throw new Error("Selected Isaac entry is not a valid USDA/USD stage.");
+    if (!(await looksLikeIsaacEntry(requestedAbsolutePath, normalizedRequestedPath))) {
+      throw new Error("Selected Isaac entry is not a valid USDA/USD stage or URDF asset.");
     }
     return normalizedRequestedPath;
   }
 
   const files = await listFilesRecursive(assetDir);
-  const stageCandidates: string[] = [];
+  const assetCandidates: string[] = [];
 
   for (const filePath of files) {
     const relativePath = toPosixRelativePath(assetDir, filePath);
     if (!relativePath) {
       continue;
     }
-    if (await looksLikeUsdStage(filePath, relativePath)) {
-      stageCandidates.push(relativePath);
+    if (await looksLikeIsaacEntry(filePath, relativePath)) {
+      assetCandidates.push(relativePath);
     }
   }
 
-  stageCandidates.sort(compareStageCandidates);
-  const candidate = stageCandidates[0];
+  assetCandidates.sort(compareIsaacCandidates);
+  const candidate = assetCandidates[0];
   if (!candidate) {
-    throw new Error("Uploaded asset does not contain a USDA/USD stage.");
+    throw new Error("Uploaded asset does not contain a USDA/USD stage or URDF asset.");
   }
   return candidate;
 }
@@ -411,9 +464,16 @@ async function listFilesRecursive(rootDir: string): Promise<string[]> {
   return files;
 }
 
+async function looksLikeIsaacEntry(absolutePath: string, relativePath: string): Promise<boolean> {
+  return (
+    (await looksLikeUsdStage(absolutePath, relativePath)) ||
+    (await looksLikeUrdfAsset(absolutePath, relativePath))
+  );
+}
+
 async function looksLikeUsdStage(absolutePath: string, relativePath: string): Promise<boolean> {
   const extension = path.posix.extname(relativePath).toLowerCase();
-  if (!STAGE_EXTENSIONS.includes(extension as (typeof STAGE_EXTENSIONS)[number])) {
+  if (!USD_STAGE_EXTENSIONS.includes(extension as (typeof USD_STAGE_EXTENSIONS)[number])) {
     return false;
   }
 
@@ -424,6 +484,23 @@ async function looksLikeUsdStage(absolutePath: string, relativePath: string): Pr
   try {
     const source = await fs.readFile(absolutePath, "utf8");
     return source.trimStart().startsWith("#usda");
+  } catch {
+    return false;
+  }
+}
+
+async function looksLikeUrdfAsset(absolutePath: string, relativePath: string): Promise<boolean> {
+  const extension = path.posix.extname(relativePath).toLowerCase();
+  if (URDF_EXTENSIONS.includes(extension as (typeof URDF_EXTENSIONS)[number])) {
+    return true;
+  }
+  if (extension !== ".xml") {
+    return false;
+  }
+
+  try {
+    const source = await fs.readFile(absolutePath, "utf8");
+    return source.trimStart().startsWith("<robot") || source.includes("<robot ");
   } catch {
     return false;
   }
@@ -458,23 +535,29 @@ async function pathExists(candidatePath: string) {
   }
 }
 
-function compareStageCandidates(left: string, right: string) {
-  const leftWeight = stageExtensionPriority(path.posix.extname(left).toLowerCase());
-  const rightWeight = stageExtensionPriority(path.posix.extname(right).toLowerCase());
+function compareIsaacCandidates(left: string, right: string) {
+  const leftWeight = isaacExtensionPriority(path.posix.extname(left).toLowerCase());
+  const rightWeight = isaacExtensionPriority(path.posix.extname(right).toLowerCase());
   if (leftWeight !== rightWeight) {
     return leftWeight - rightWeight;
   }
   return left.localeCompare(right);
 }
 
-function stageExtensionPriority(extension: string) {
+function isaacExtensionPriority(extension: string) {
   if (extension === ".usda") {
     return 0;
   }
   if (extension === ".usd") {
     return 1;
   }
-  return 2;
+  if (extension === ".usdc") {
+    return 2;
+  }
+  if (extension === ".urdf") {
+    return 3;
+  }
+  return 4;
 }
 
 async function allocatePort(): Promise<number> {
@@ -548,18 +631,139 @@ function buildBrowserWsUrl(requestHostname: string, port: number): string {
   return `ws://${normalizedHost}:${port}`;
 }
 
-function appendLogLines(target: string[], chunk: string) {
+function toSessionInfo(session: ManagedSession): IsaacSessionInfo {
+  return {
+    sessionId: session.id,
+    wsUrl: session.wsUrl,
+    assetBaseUrl: session.assetBaseUrl,
+    selectedEntryPath: session.selectedEntryPath,
+    expiresAt: new Date(session.expiresAt).toISOString(),
+    status: session.status,
+    phase: session.phase,
+    statusMessage: session.statusMessage,
+    recentLogs: session.logs.slice(-RECENT_LOG_LIMIT),
+    createdAt: new Date(session.createdAt).toISOString(),
+    updatedAt: new Date(session.updatedAt).toISOString(),
+    readyAt: session.readyAt ? new Date(session.readyAt).toISOString() : null
+  };
+}
+
+function appendLogLines(target: string[], chunk: string, source: string): string[] {
+  const appendedLines: string[] = [];
+
   for (const line of chunk.split(/\r?\n/)) {
     const normalized = line.trimEnd();
     if (!normalized) {
       continue;
     }
-    target.push(normalized);
+    appendedLines.push(normalized);
+    target.push(`[${source}] ${normalized}`);
   }
 
   if (target.length > MAX_LOG_LINES) {
     target.splice(0, target.length - MAX_LOG_LINES);
   }
+
+  return appendedLines;
+}
+
+function buildInitialStatusMessage(selectedEntryPath: string) {
+  if (looksLikeUrdfPath(selectedEntryPath)) {
+    return "Launching Isaac Sim to import the URDF and build a renderable USD stage.";
+  }
+  return "Launching Isaac Sim bridge for the selected USD stage.";
+}
+
+function buildRuntimeWaitMessage(selectedEntryPath: string) {
+  if (looksLikeUrdfPath(selectedEntryPath)) {
+    return "Isaac Sim is starting and importing the URDF. This can take a while.";
+  }
+  return "Isaac Sim is starting and loading the USD stage. This can take a while.";
+}
+
+function looksLikeUrdfPath(selectedEntryPath: string) {
+  const extension = path.posix.extname(selectedEntryPath).toLowerCase();
+  return extension === ".urdf" || extension === ".xml";
+}
+
+function updateSessionProgress(
+  session: ManagedSession,
+  phase: Exclude<IsaacSessionPhase, "ready" | "error">,
+  message: string
+) {
+  if (session.destroyPromise || session.status === "error" || session.status === "ready") {
+    return;
+  }
+
+  session.phase = phase;
+  session.status = "starting";
+  session.statusMessage = message;
+  session.updatedAt = Date.now();
+}
+
+function markSessionReady(session: ManagedSession) {
+  if (session.destroyPromise) {
+    return;
+  }
+
+  const now = Date.now();
+  session.status = "ready";
+  session.phase = "ready";
+  session.statusMessage = "Isaac websocket bridge is ready.";
+  session.updatedAt = now;
+  session.readyAt = now;
+}
+
+function markSessionError(session: ManagedSession, message: string) {
+  if (session.destroyPromise) {
+    return;
+  }
+
+  session.status = "error";
+  session.phase = "error";
+  session.statusMessage = message;
+  session.updatedAt = Date.now();
+}
+
+function updateSessionFromBridgeLog(session: ManagedSession, line: string) {
+  if (session.destroyPromise || session.status !== "starting") {
+    return;
+  }
+
+  if (line.startsWith("[isaac] starting bridge")) {
+    updateSessionProgress(
+      session,
+      "loading_stage",
+      buildRuntimeWaitMessage(session.selectedEntryPath)
+    );
+    return;
+  }
+
+  if (line.startsWith("[stage] manifest ready")) {
+    updateSessionProgress(
+      session,
+      "starting_websocket",
+      "Stage manifest is ready. Waiting for the websocket bridge to accept connections."
+    );
+    return;
+  }
+
+  if (line.startsWith("[ws] serving at")) {
+    updateSessionProgress(
+      session,
+      "starting_websocket",
+      "Websocket bridge is up. Finalizing Isaac session startup."
+    );
+  }
+}
+
+function getErrorHeadline(error: unknown, fallback: string) {
+  if (!(error instanceof Error) || !error.message) {
+    return fallback;
+  }
+
+  const [headline] = error.message.split(/\r?\n/, 1);
+  return headline || fallback;
 }
 
 function formatBridgeStartupError(session: ManagedSession, message: string): string {

@@ -42,9 +42,12 @@ export function buildPhoneFramePreview({
   let offsetInner: CrossSectionInstance | null = null;
   let inner: CrossSectionInstance | null = null;
   let frameSection: CrossSectionInstance | null = null;
+  let frameRingSection: CrossSectionInstance | null = null;
+  let ribClipArea: CrossSectionInstance | null = null;
   let innerBottom: ManifoldInstance | null = null;
   let innerVolume: ManifoldInstance | null = null;
   let frameResult: ManifoldInstance | null = null;
+  const warnings: string[] = [];
 
   try {
     sourceBody = new runtime.Manifold(manifoldMesh);
@@ -110,8 +113,116 @@ export function buildPhoneFramePreview({
       }
     }
 
+    frameRingSection = currentFrameSection;
     frameSection = currentFrameSection;
     frameResult = currentFrameResult;
+
+    if (config.frame.seams.length === 0) {
+      warnings.push("No seam cuts configured");
+    }
+
+    if (config.frame.ribs.length > 0) {
+      const ribDepth = getRibDepth(size, config.frame.thickness);
+      const ribJoinOverlap = getRibJoinOverlap(config.frame.thickness);
+      const ribSimplifyEpsilon = 1e-4;
+      const innerBounds = inner.bounds();
+      ribClipArea = frameRingSection.add(inner);
+      let currentFootprintSection = frameSection;
+      let currentFrameResultWithRibs = frameResult;
+
+      for (const [index, rib] of config.frame.ribs.entries()) {
+        let ribRectangle: CrossSectionInstance | null = null;
+        let ribSection: CrossSectionInstance | null = null;
+        let ribAnchor: CrossSectionInstance | null = null;
+        let ribVolumeBase: ManifoldInstance | null = null;
+        let ribVolume: ManifoldInstance | null = null;
+
+        try {
+          ribRectangle = createRibSection(
+            runtime,
+            rib.position,
+            rib.distance,
+            rib.width,
+            innerBounds,
+            ribDepth,
+            ribJoinOverlap
+          );
+          ribSection = ribRectangle.intersect(ribClipArea);
+
+          if (ribSection.isEmpty()) {
+            warnings.push(`Ignored rib ${index + 1}: outside the phone outline.`);
+            continue;
+          }
+
+          const simplifiedRibSection = ribSection.simplify(
+            Math.max(rib.width / 64, ribSimplifyEpsilon)
+          );
+          if (ribSection !== simplifiedRibSection) {
+            tryDelete(ribSection);
+            ribSection = simplifiedRibSection;
+          }
+
+          ribAnchor = ribSection.intersect(frameRingSection);
+          if (ribAnchor.isEmpty()) {
+            warnings.push(`Ignored rib ${index + 1}: does not touch the remaining frame.`);
+            continue;
+          }
+
+          const ribHeight = normalizeRibHeight(rib.thickness, size.z);
+          if (ribHeight !== rib.thickness) {
+            warnings.push(
+              `Clamped rib ${index + 1} thickness from ${formatScalar(rib.thickness)} to ${formatScalar(ribHeight)}.`
+            );
+          }
+
+          const ribOffset = clampRibOffset(rib.offset, ribHeight, size.z);
+          if (ribOffset !== rib.offset) {
+            warnings.push(
+              `Clamped rib ${index + 1} offset from ${formatScalar(rib.offset)} to ${formatScalar(ribOffset)}.`
+            );
+          }
+
+          ribVolumeBase = ribSection.extrude(ribHeight, 0, 0, [1, 1], true);
+          ribVolume =
+            ribOffset === 0 ? ribVolumeBase : ribVolumeBase.translate(0, 0, ribOffset);
+          const nextFrameResult = runtime.Manifold.union([
+            currentFrameResultWithRibs,
+            ribVolume
+          ]);
+          const nextFootprintSection = currentFootprintSection.add(ribSection);
+          const simplifiedFootprintSection = nextFootprintSection.simplify(
+            Math.max(rib.width / 64, ribSimplifyEpsilon)
+          );
+
+          if (currentFrameResultWithRibs !== nextFrameResult) {
+            tryDelete(currentFrameResultWithRibs);
+          }
+          if (
+            currentFootprintSection !== frameRingSection &&
+            currentFootprintSection !== simplifiedFootprintSection
+          ) {
+            tryDelete(currentFootprintSection);
+          }
+          if (nextFootprintSection !== simplifiedFootprintSection) {
+            tryDelete(nextFootprintSection);
+          }
+
+          currentFrameResultWithRibs = nextFrameResult;
+          currentFootprintSection = simplifiedFootprintSection;
+        } finally {
+          tryDelete(ribRectangle);
+          tryDelete(ribSection);
+          tryDelete(ribAnchor);
+          if (ribVolumeBase !== ribVolume) {
+            tryDelete(ribVolumeBase);
+          }
+          tryDelete(ribVolume);
+        }
+      }
+
+      frameResult = currentFrameResultWithRibs;
+      frameSection = currentFootprintSection;
+    }
 
     const frameGeometry = manifoldToBufferGeometry(frameResult);
     frameGeometry.computeBoundingBox();
@@ -119,10 +230,6 @@ export function buildPhoneFramePreview({
     frameGeometry.computeVertexNormals();
 
     const contourCount = frameSection.numContour();
-    const warnings: string[] = [];
-    if (config.frame.seams.length === 0) {
-      warnings.push("No seam cuts configured");
-    }
 
     return {
       sourceGeometry,
@@ -141,6 +248,10 @@ export function buildPhoneFramePreview({
     tryDelete(frameResult);
     tryDelete(innerVolume);
     tryDelete(innerBottom);
+    tryDelete(ribClipArea);
+    if (frameRingSection !== frameSection) {
+      tryDelete(frameRingSection);
+    }
     tryDelete(frameSection);
     tryDelete(inner);
     tryDelete(offsetInner);
@@ -151,6 +262,23 @@ export function buildPhoneFramePreview({
 
 function getSeamCutDepth(size: THREE.Vector3, thickness: number) {
   return Math.max(thickness * 1.35, Math.min(size.x, size.y) * 0.03);
+}
+
+function getRibDepth(size: THREE.Vector3, thickness: number) {
+  return Math.max(thickness * 2.25, Math.min(size.x, size.y) * 0.08, 1);
+}
+
+function normalizeRibHeight(thickness: number, sourceThickness: number) {
+  return Math.min(thickness, sourceThickness);
+}
+
+function clampRibOffset(offset: number, ribHeight: number, sourceThickness: number) {
+  const maxOffset = Math.max((sourceThickness - ribHeight) / 2, 0);
+  return THREE.MathUtils.clamp(offset, -maxOffset, maxOffset);
+}
+
+function getRibJoinOverlap(thickness: number) {
+  return Math.max(thickness * 0.24, 0.3);
 }
 
 function getBooleanOvershoot(size: THREE.Vector3, thickness: number) {
@@ -185,6 +313,44 @@ function createSeamCutter(
   }
   return runtime.CrossSection.square([depth, width], true).translate(
     size.x / 2 - depth / 2,
+    distance
+  );
+}
+
+function createRibSection(
+  runtime: BuildPreviewOptions["runtime"],
+  position: BuildPreviewOptions["config"]["frame"]["ribs"][number]["position"],
+  distance: number,
+  width: number,
+  bounds: {
+    min: [number, number];
+    max: [number, number];
+  },
+  depth: number,
+  joinOverlap: number
+) {
+  const span = depth + joinOverlap;
+
+  if (position === "top") {
+    return runtime.CrossSection.square([width, span], true).translate(
+      distance,
+      bounds.max[1] + (joinOverlap - depth) / 2
+    );
+  }
+  if (position === "bottom") {
+    return runtime.CrossSection.square([width, span], true).translate(
+      distance,
+      bounds.min[1] + (depth - joinOverlap) / 2
+    );
+  }
+  if (position === "left") {
+    return runtime.CrossSection.square([span, width], true).translate(
+      bounds.min[0] + (depth - joinOverlap) / 2,
+      distance
+    );
+  }
+  return runtime.CrossSection.square([span, width], true).translate(
+    bounds.max[0] + (joinOverlap - depth) / 2,
     distance
   );
 }
@@ -250,4 +416,8 @@ function tryDelete(candidate: { delete?: () => void } | null) {
   } catch {
     // Ignore WASM cleanup failures during teardown.
   }
+}
+
+function formatScalar(value: number) {
+  return Number.isInteger(value) ? `${value}` : value.toFixed(2);
 }

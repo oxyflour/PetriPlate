@@ -58,10 +58,12 @@ code {
   width: 100%;
   min-height: 100vh;
   min-height: 100dvh;
+  height: 100dvh;
   padding: 16px;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
   gap: 16px;
+  overflow: hidden;
 }
 
 .hero-card,
@@ -72,10 +74,11 @@ code {
 }
 
 .hero-card {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  padding: 28px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 18px;
   border: 1px solid rgba(255, 255, 255, 0.5);
   border-radius: var(--radius-xl);
   background:
@@ -84,17 +87,26 @@ code {
 }
 
 .hero-copy {
-  max-width: 760px;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  column-gap: 14px;
+  row-gap: 2px;
+  max-width: none;
 }
 
 .eyebrow,
 .panel-kicker {
-  margin: 0 0 10px;
+  margin: 0 0 8px;
   font-size: 0.76rem;
   font-weight: 700;
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--accent);
+}
+
+.hero-copy .eyebrow {
+  margin: 0;
 }
 
 .hero-card h1,
@@ -106,9 +118,10 @@ code {
 }
 
 .hero-card h1 {
-  max-width: 10ch;
-  font-size: clamp(2rem, 3.8vw, 3.5rem);
-  line-height: 0.95;
+  max-width: none;
+  font-size: clamp(1.2rem, 1.45vw, 1.55rem);
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .hero-text,
@@ -120,17 +133,27 @@ code {
 }
 
 .hero-text {
-  max-width: 54ch;
-  margin-top: 18px;
-  font-size: 1.02rem;
+  max-width: none;
+  margin-top: 0;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.hero-inline-note {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .hero-actions {
   display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  gap: 14px;
-  min-width: 220px;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: none;
 }
 
 .solid-button,
@@ -145,7 +168,7 @@ code {
 .solid-button,
 .ghost-button,
 .dropzone-button {
-  padding: 14px 18px;
+  padding: 10px 14px;
   font-weight: 700;
 }
 
@@ -175,9 +198,9 @@ code {
 .dropzone {
   display: flex;
   justify-content: space-between;
-  gap: 20px;
+  gap: 18px;
   align-items: center;
-  padding: 24px 26px;
+  padding: 18px 22px;
   border-radius: var(--radius-lg);
   border: 1px dashed rgba(16, 22, 27, 0.18);
   background: rgba(255, 255, 255, 0.56);
@@ -189,8 +212,8 @@ code {
 }
 
 .dropzone-title {
-  margin: 0 0 6px;
-  font-size: 1.08rem;
+  margin: 0 0 4px;
+  font-size: 1rem;
   font-weight: 700;
 }
 
@@ -200,6 +223,7 @@ code {
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 18px;
   min-height: 0;
+  overflow: hidden;
 }
 
 .panel {
@@ -525,7 +549,8 @@ code {
   background: rgba(81, 202, 194, 0.18);
 }
 
-.entry-kind-usda {
+.entry-kind-isaacstage,
+.entry-kind-isaacurdf {
   color: #5f3f8d;
   background: rgba(172, 144, 255, 0.18);
 }
@@ -552,6 +577,11 @@ code {
   border-radius: 16px;
 }
 
+.runtime-card .code-card,
+.empty-preview .code-card {
+  width: 100%;
+}
+
 .code-card-title {
   margin: 0 0 10px;
   font-weight: 700;
@@ -565,6 +595,11 @@ code {
   line-height: 1.55;
   max-height: 280px;
   overflow: auto;
+}
+
+.runtime-card .code-card pre,
+.empty-preview .code-card pre {
+  max-height: 180px;
 }
 
 .isaac-card,
@@ -593,21 +628,45 @@ code {
 }
 
 @media (max-width: 1100px) {
+  .lab-shell {
+    height: auto;
+    overflow: visible;
+  }
+
   .hero-card {
+    display: flex;
     flex-direction: column;
+    align-items: stretch;
   }
 
   .hero-actions {
+    display: flex;
     min-width: 0;
     flex-direction: row;
     flex-wrap: wrap;
+    justify-content: flex-start;
     align-items: flex-start;
+    max-width: none;
+  }
+
+  .hero-copy {
+    display: block;
+  }
+
+  .hero-card h1 {
+    white-space: normal;
+  }
+
+  .hero-inline-note {
+    margin-top: 6px;
+    white-space: normal;
   }
 
   .dashboard {
     grid-template-columns: 1fr;
     grid-template-rows: auto;
     min-height: auto;
+    overflow: visible;
   }
 
   .preview-panel {
@@ -623,8 +682,10 @@ code {
 
 @media (max-width: 720px) {
   .lab-shell {
+    height: auto;
     padding: 12px;
     gap: 12px;
+    overflow: visible;
   }
 
   .hero-card,

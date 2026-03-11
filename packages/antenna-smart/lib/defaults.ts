@@ -8,7 +8,8 @@ export const DEFAULT_PHONE_CONFIG: PhoneConfig = {
       { position: "top", width: 2, distance: 0 },
       { position: "left", width: 2, distance: 30 },
       { position: "right", width: 2, distance: -22 }
-    ]
+    ],
+    ribs: [{ position: "left", width: 2.2, distance: 0, thickness: 6.4, offset: 0 }]
   }
 };
 

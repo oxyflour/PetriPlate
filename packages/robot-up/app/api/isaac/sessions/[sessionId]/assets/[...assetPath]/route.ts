@@ -34,6 +34,9 @@ function getContentType(filePath: string) {
   if (extension === ".usda" || extension === ".usd" || extension === ".usdc") {
     return "application/octet-stream";
   }
+  if (extension === ".urdf") {
+    return "text/plain; charset=utf-8";
+  }
   if (extension === ".png") {
     return "image/png";
   }
