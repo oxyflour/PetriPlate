@@ -21,6 +21,8 @@ import type {
   PhoneConfig,
   PhoneFrameFeature,
   PhoneFrameFeaturePosition,
+  PhoneMidFrameFeature,
+  PhoneMidFramePocket,
   PhoneRibFeature,
   SourceModel
 } from "../lib/types";
@@ -131,9 +133,13 @@ export default function AntennaStudio() {
   const frameFeatureHint = useMemo(() => {
     const parsed = parsePhoneConfig(deferredEditorValue);
     if (!parsed.ok) {
-      return "distance is measured from the midpoint of the selected edge. rib.thickness controls z thickness and rib.offset shifts it along z.";
+      return "distance is measured from the midpoint of the selected edge. rib.thickness controls z thickness, midFrame.gap offsets inward from the frame, and midFrame.pockets mill from +Z.";
     }
-    return describeFrameFeatures(parsed.value.frame.seams, parsed.value.frame.ribs);
+    return describeFrameFeatures(
+      parsed.value.frame.seams,
+      parsed.value.frame.ribs,
+      parsed.value.frame.midFrame
+    );
   }, [deferredEditorValue]);
 
   return (
@@ -228,8 +234,10 @@ export default function AntennaStudio() {
               <p className="panel-label">Preview</p>
               <strong>OBJ body + generated frame</strong>
               <span>
-                The preview assumes the smallest source axis is thickness and
-                aligns it to <code>Z</code> before projecting to <code>XY</code>.
+                The preview assumes the smallest source axis is thickness,
+                aligns it to <code>Z</code>, then builds the outer frame,
+                ribs, and mid-frame pockets. Screen-side CNC cuts are milled
+                from <code>+Z</code>.
               </span>
             </div>
           </header>
@@ -259,7 +267,11 @@ export default function AntennaStudio() {
               </span>
               <span>
                 <i className="legend-chip rib" />
-                Ribs are unioned into the frame shell
+                Ribs bridge the frame shell and mid-frame
+              </span>
+              <span>
+                <i className="legend-chip pocket" />
+                Mid-frame pockets are milled from the screen side
               </span>
             </div>
           </div>
@@ -325,6 +337,10 @@ function parsePhoneConfig(source: string): ParsedPhoneConfig {
 
     const normalizedRibs = normalizeRibs(ribs ?? []);
 
+    const normalizedMidFrame = normalizeMidFrame(
+      raw.frame?.midFrame ?? DEFAULT_PHONE_CONFIG.frame.midFrame
+    );
+
     const normalizedThickness = Number(thickness);
 
     return {
@@ -333,7 +349,8 @@ function parsePhoneConfig(source: string): ParsedPhoneConfig {
         frame: {
           thickness: normalizedThickness,
           seams: normalizedSeams,
-          ribs: normalizedRibs
+          ribs: normalizedRibs,
+          midFrame: normalizedMidFrame
         }
       }
     };
@@ -413,6 +430,65 @@ function normalizeRibs(candidates: unknown[]): PhoneRibFeature[] {
   });
 }
 
+function normalizeMidFrame(candidate: unknown): PhoneMidFrameFeature {
+  const feature = candidate as Partial<PhoneMidFrameFeature> | null;
+  const gap = feature?.gap;
+  const pockets = feature?.pockets;
+
+  if (
+    !feature ||
+    typeof gap !== "number" ||
+    !Number.isFinite(gap) ||
+    gap <= 0 ||
+    !Array.isArray(pockets)
+  ) {
+    throw new Error("frame.midFrame must include a positive gap and a pockets array");
+  }
+
+  return {
+    gap: Number(gap),
+    pockets: normalizeMidFramePockets(pockets)
+  };
+}
+
+function normalizeMidFramePockets(candidates: unknown[]): PhoneMidFramePocket[] {
+  return candidates.map((candidate, index) => {
+    const pocket = candidate as Partial<PhoneMidFramePocket> | null;
+    const label = pocket?.label;
+    const offset = pocket?.offset;
+    const height = pocket?.height;
+    const inset = pocket?.inset;
+    const depth = pocket?.depth;
+
+    if (
+      !pocket ||
+      typeof label !== "string" ||
+      label.trim().length === 0 ||
+      typeof offset !== "number" ||
+      !Number.isFinite(offset) ||
+      typeof height !== "number" ||
+      !Number.isFinite(height) ||
+      height <= 0 ||
+      typeof inset !== "number" ||
+      !Number.isFinite(inset) ||
+      inset < 0 ||
+      typeof depth !== "number" ||
+      !Number.isFinite(depth) ||
+      depth <= 0
+    ) {
+      throw new Error(`Invalid mid-frame pocket at index ${index}`);
+    }
+
+    return {
+      label: label.trim(),
+      offset: Number(offset),
+      height: Number(height),
+      inset: Number(inset),
+      depth: Number(depth)
+    };
+  });
+}
+
 function isPhoneFrameFeaturePosition(value: unknown): value is PhoneFrameFeaturePosition {
   return value === "top" || value === "left" || value === "right" || value === "bottom";
 }
@@ -436,12 +512,13 @@ function pushLog(
 
 function describeFrameFeatures(
   seams: PhoneConfig["frame"]["seams"],
-  ribs: PhoneConfig["frame"]["ribs"]
+  ribs: PhoneConfig["frame"]["ribs"],
+  midFrame: PhoneConfig["frame"]["midFrame"]
 ) {
   if (seams.length === 0 && ribs.length === 0) {
-    return "No seams or ribs configured. distance is measured from the edge midpoint. rib.thickness controls z thickness and rib.offset shifts it along z.";
+    return `No seams or ribs configured. mid-frame gap is ${formatNumber(midFrame.gap)} and ${midFrame.pockets.length} screen-side pockets are active.`;
   }
-  return `Configured ${seams.length} seam cuts and ${ribs.length} ribs. distance is measured from the edge midpoint. rib.thickness controls z thickness and rib.offset shifts it along z.`;
+  return `Configured ${seams.length} seam cuts, ${ribs.length} ribs, and ${midFrame.pockets.length} mid-frame pockets. distance is measured from the edge midpoint, midFrame.gap offsets inward from the frame, and pockets mill from +Z.`;
 }
 
 function formatNumber(value: number) {

@@ -13,6 +13,7 @@ import {
   createSampleIsaacAssetFile,
   resolveIsaacEntrySelection,
   resolveMujocoEntrySelection,
+  resolveRendererEntrySelection,
   revokeAssetObjectUrls
 } from "../src/lib/asset-analysis";
 import type {
@@ -27,15 +28,17 @@ import type {
   MujocoPoseFrameMessage,
   MujocoPoseMessage,
   MujocoSessionInfo,
+  ParsedMjcfScene,
   RuntimeKind
 } from "../src/lib/types";
 
 const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   mujoco: "MuJoCo",
-  isaacsim: "Isaac Sim"
+  isaacsim: "Isaac Sim",
+  renderer: "Renderer"
 };
 
-const ACCEPT_ATTR = ".xml,.mjcf,.zip,.urdf,.usda,.usd,.usdc,.obj,.stl,.msh";
+const ACCEPT_ATTR = ".xml,.mjcf,.zip,.urdf,.usda,.usd,.usdc,.obj,.stl,.ply,.msh";
 const COLLAPSED_ENTRY_COUNT = 6;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const ISAAC_STATUS_POLL_INTERVAL_MS = 1_000;
@@ -50,6 +53,7 @@ export default function RobotLab() {
   const [activeRuntime, setActiveRuntime] = useState<RuntimeKind | null>(null);
   const [selectedMujocoEntryPath, setSelectedMujocoEntryPath] = useState<string | null>(null);
   const [selectedIsaacEntryPath, setSelectedIsaacEntryPath] = useState<string | null>(null);
+  const [selectedRendererEntryPath, setSelectedRendererEntryPath] = useState<string | null>(null);
   const [showAllEntries, setShowAllEntries] = useState(false);
   const [isBusy, setIsBusy] = useState(true);
   const [dragActive, setDragActive] = useState(false);
@@ -111,23 +115,35 @@ export default function RobotLab() {
   const currentIsaacEntryPath = currentIsaacSelection?.entry?.path || null;
   const currentIsaacPreview =
     currentIsaacSelection?.preview || analysis?.isaacPreview || null;
+  const currentRendererSelection = useMemo(() => {
+    if (!analysis || currentRuntime !== "renderer") {
+      return null;
+    }
+    return resolveRendererEntrySelection(analysis.entries, selectedRendererEntryPath);
+  }, [analysis, currentRuntime, selectedRendererEntryPath]);
+  const currentRendererScene = currentRendererSelection?.scene || null;
 
   const currentEntry =
     currentRuntime === "mujoco"
       ? currentMujocoSelection?.entry || null
       : currentRuntime === "isaacsim"
         ? currentIsaacSelection?.entry || null
+        : currentRuntime === "renderer"
+          ? currentRendererSelection?.entry || null
       : currentRuntime
         ? analysis?.runtimeEntries[currentRuntime] || null
         : null;
 
   const currentWarnings = useMemo(() => {
     const baseWarnings = analysis?.warnings || [];
-    if (currentRuntime !== "mujoco" || !currentMujocoSelection) {
-      return baseWarnings;
+    if (currentRuntime === "mujoco" && currentMujocoSelection) {
+      return [...new Set([...baseWarnings, ...currentMujocoSelection.warnings])];
     }
-    return [...baseWarnings, ...currentMujocoSelection.warnings];
-  }, [analysis, currentRuntime, currentMujocoSelection]);
+    if (currentRuntime === "renderer" && currentRendererSelection) {
+      return [...new Set([...baseWarnings, ...currentRendererSelection.warnings])];
+    }
+    return baseWarnings;
+  }, [analysis, currentRuntime, currentMujocoSelection, currentRendererSelection]);
 
   const visibleEntries = useMemo(() => {
     const entries = analysis?.entries || [];
@@ -568,6 +584,7 @@ export default function RobotLab() {
       setActiveRuntime(nextAnalysis.defaultRuntime);
       setSelectedMujocoEntryPath(nextAnalysis.runtimeEntries.mujoco?.path || null);
       setSelectedIsaacEntryPath(nextAnalysis.runtimeEntries.isaacsim?.path || null);
+      setSelectedRendererEntryPath(nextAnalysis.runtimeEntries.renderer?.path || null);
       setShowAllEntries(false);
     } catch (nextError) {
       setError(toMessage(nextError, "Sample asset could not be loaded."));
@@ -589,6 +606,7 @@ export default function RobotLab() {
       setActiveRuntime(nextAnalysis.defaultRuntime);
       setSelectedMujocoEntryPath(nextAnalysis.runtimeEntries.mujoco?.path || null);
       setSelectedIsaacEntryPath(nextAnalysis.runtimeEntries.isaacsim?.path || null);
+      setSelectedRendererEntryPath(nextAnalysis.runtimeEntries.renderer?.path || null);
       setShowAllEntries(false);
     } catch (nextError) {
       setError(toMessage(nextError, "Isaac sample asset could not be loaded."));
@@ -610,6 +628,7 @@ export default function RobotLab() {
       setActiveRuntime(nextAnalysis.defaultRuntime);
       setSelectedMujocoEntryPath(nextAnalysis.runtimeEntries.mujoco?.path || null);
       setSelectedIsaacEntryPath(nextAnalysis.runtimeEntries.isaacsim?.path || null);
+      setSelectedRendererEntryPath(nextAnalysis.runtimeEntries.renderer?.path || null);
       setShowAllEntries(false);
     } catch (nextError) {
       setError(toMessage(nextError, "Official Franka USD sample could not be loaded."));
@@ -628,6 +647,7 @@ export default function RobotLab() {
       setActiveRuntime(nextAnalysis.defaultRuntime);
       setSelectedMujocoEntryPath(nextAnalysis.runtimeEntries.mujoco?.path || null);
       setSelectedIsaacEntryPath(nextAnalysis.runtimeEntries.isaacsim?.path || null);
+      setSelectedRendererEntryPath(nextAnalysis.runtimeEntries.renderer?.path || null);
       setShowAllEntries(false);
     } catch (nextError) {
       setError(toMessage(nextError, "Asset could not be inspected."));
@@ -641,9 +661,9 @@ export default function RobotLab() {
     <main className="lab-shell">
       <section className="hero-card">
         <div className="hero-copy">
-          <p className="eyebrow">robot-up2 / task 03</p>
-          <h1>Dual Runtime Router</h1>
-          <p className="hero-inline-note">MuJoCo + Isaac live runtime preview.</p>
+          <p className="eyebrow">robot-up2 / task 08</p>
+          <h1>Runtime + Renderer Preview</h1>
+          <p className="hero-inline-note">MuJoCo, Isaac, mesh, and 3DGS asset inspection.</p>
         </div>
 
         <div className="hero-actions">
@@ -703,11 +723,13 @@ export default function RobotLab() {
         }}
       >
         <div>
-          <p className="dropzone-title">Drop `.xml`, `.mjcf`, `.urdf`, `.usda`, `.usd`, `.usdc`, or `.zip` here</p>
+          <p className="dropzone-title">
+            Drop `.xml`, `.mjcf`, `.urdf`, `.usda`, `.usd`, `.usdc`, `.obj`, `.stl`, `.ply`, or `.zip` here
+          </p>
           <p className="dropzone-text">
-            MuJoCo assets stream live pose frames; Isaac assets stream stage
-            hierarchy, renderable geometry, and transform updates from a
-            headless `env_isaaclab` session.
+            MuJoCo assets stream live pose frames, Isaac assets stream stage
+            hierarchy, and standalone mesh assets can be previewed directly,
+            including 3D Gaussian Splatting PLY files.
           </p>
         </div>
         <button
@@ -762,6 +784,12 @@ export default function RobotLab() {
                 sessionStatus={isaacSessionStatus}
                 error={isaacSessionError}
               />
+            )
+          ) : currentRuntime === "renderer" ? (
+            currentRendererScene ? (
+              <MujocoPreview scene={currentRendererScene} />
+            ) : (
+              <EmptyPreviewState />
             )
           ) : (
             <EmptyPreviewState />
@@ -851,6 +879,28 @@ export default function RobotLab() {
             </div>
           ) : null}
 
+          {currentRuntime === "renderer" &&
+          analysis?.runtimeCandidates.renderer &&
+          analysis.runtimeCandidates.renderer.length > 1 ? (
+            <div className="entry-selector">
+              <label className="entry-selector-label" htmlFor="renderer-entry-select">
+                Render Asset
+              </label>
+              <select
+                id="renderer-entry-select"
+                className="entry-select"
+                value={selectedRendererEntryPath || ""}
+                onChange={(event) => setSelectedRendererEntryPath(event.target.value || null)}
+              >
+                {analysis.runtimeCandidates.renderer.map((entry) => (
+                  <option key={entry.path} value={entry.path}>
+                    {entry.path}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+
           {currentWarnings.length ? (
             <div className="callout-list">
               {currentWarnings.map((warning) => (
@@ -889,7 +939,15 @@ export default function RobotLab() {
           <div className="panel-header">
             <div>
               <p className="panel-kicker">Details</p>
-              <h2>{currentRuntime === "mujoco" ? "MJCF Summary" : "Isaac Asset Summary"}</h2>
+              <h2>
+                {currentRuntime === "mujoco"
+                  ? "MJCF Summary"
+                  : currentRuntime === "isaacsim"
+                    ? "Isaac Asset Summary"
+                    : currentRuntime === "renderer"
+                      ? "Mesh Summary"
+                      : "Asset Summary"}
+              </h2>
             </div>
           </div>
 
@@ -908,9 +966,11 @@ export default function RobotLab() {
               manifest={isaacManifest}
               connectionStatus={isaacConnectionStatus}
             />
+          ) : currentRuntime === "renderer" ? (
+            <RendererSummary scene={currentRendererScene} entry={currentEntry} />
           ) : (
             <p className="muted-line">
-              Upload a MuJoCo or Isaac Sim asset to populate the detail panel.
+              Upload a MuJoCo, Isaac Sim, mesh, or 3DGS asset to populate the detail panel.
             </p>
           )}
         </article>
@@ -977,6 +1037,43 @@ function MjcfSummary({
       ) : (
         <p className="muted-line">All detected MuJoCo geoms are renderable in this pass.</p>
       )}
+    </>
+  );
+}
+
+function RendererSummary({
+  scene,
+  entry
+}: {
+  scene: ParsedMjcfScene | null;
+  entry: AssetFileEntry | null;
+}) {
+  if (!scene || !entry) {
+    return (
+      <p className="muted-line">
+        Renderer mode is selected, but no mesh or PLY asset could be resolved.
+      </p>
+    );
+  }
+
+  return (
+    <>
+      <dl className="stats-grid">
+        <Stat label="Asset" value={entry.path} />
+        <Stat label="Format" value={entry.extension.toUpperCase() || "--"} />
+        <Stat label="Renderables" value={String(scene.renderedGeomCount)} />
+        <Stat label="Companion PLY" value={String(Math.max(scene.geoms.length - 1, 0))} />
+      </dl>
+
+      <p className="muted-line">
+        Standalone renderer uses the same preview pipeline as MuJoCo mesh assets,
+        including optional 3DGS-based environment lighting.
+      </p>
+
+      <div className="code-card">
+        <p className="code-card-title">Rendered Assets</p>
+        <pre>{scene.geoms.map((geom) => geom.name).join("\n")}</pre>
+      </div>
     </>
   );
 }
@@ -1189,10 +1286,10 @@ function EmptyPreviewState() {
   return (
     <div className="empty-preview">
       <p className="panel-kicker">Awaiting supported asset</p>
-      <h3>No MuJoCo or USD entry was resolved</h3>
+      <h3>No supported preview entry was resolved</h3>
       <p className="hero-text">
-        Upload a compatible XML, MJCF, USD stage, or zip archive to activate the
-        corresponding simulator branch.
+        Upload a compatible XML, MJCF, USD stage, mesh, 3DGS PLY, or zip archive
+        to activate the corresponding preview branch.
       </p>
     </div>
   );

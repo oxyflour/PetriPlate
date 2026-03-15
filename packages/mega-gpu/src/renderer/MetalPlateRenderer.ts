@@ -6,7 +6,17 @@ import {
 } from "./hdrLoader";
 import type { HDRTextureData } from "./hdrLoader";
 import { DEFAULT_HEIGHT_WGSL } from "./defaultHeight";
-import type { DebugViewId } from "./presets";
+import type { DebugViewId, ShadingModeId } from "./presets";
+import {
+  buildHeightToSlopeShader,
+  buildSatRowShader
+} from "./shaders/dynamicPreprocess";
+import {
+  BUILD_HISTOGRAM_SHADER,
+  NORMALIZE_HISTOGRAM_SHADER
+} from "./shaders/histogram";
+import { RENDER_SHADER } from "./shaders/renderPlate";
+import { SAT_COLUMN_SHADER } from "./shaders/satColumn";
 
 type Vec2 = [number, number];
 type Vec3 = [number, number, number];
@@ -21,6 +31,7 @@ export type MetalPlateSnapshot = {
 
 type RuntimeConfig = {
   debugView: DebugViewId;
+  shadingMode: ShadingModeId;
 };
 
 export type CompileLevel = "info" | "warning" | "error";
@@ -45,6 +56,15 @@ const BASE_ROUGHNESS = 0.06;
 const ENV_EXPOSURE = 1.18;
 const MICRO_ATLAS_CELLS = 8;
 const MICRO_ATLAS_RESOLUTION = 512;
+const HISTOGRAM_TILE_SIZE = 16;
+const HISTOGRAM_BIN_COUNT = 16;
+const HISTOGRAM_SLOPE_MAX = 4;
+const HISTOGRAM_TILE_COUNT = MICRO_ATLAS_RESOLUTION / HISTOGRAM_TILE_SIZE;
+const HISTOGRAM_BIN_TOTAL = HISTOGRAM_BIN_COUNT * HISTOGRAM_BIN_COUNT;
+const GLINT_GAIN = 52;
+const GLINT_WINDOW_SCALE = 0.45;
+const FRAME_UNIFORM_VECTORS = 10;
+const BUILD_UNIFORM_VECTORS = 2;
 export const MIN_CAMERA_DISTANCE_MM = 30;
 export const MAX_CAMERA_DISTANCE_MM = 140;
 export const DEFAULT_CAMERA_DISTANCE_MM = 62;
@@ -55,7 +75,15 @@ const DEBUG_VIEW_INDEX: Record<DebugViewId, number> = {
   beauty: 0,
   footprint: 1,
   coverage: 2,
-  normal: 3
+  normal: 3,
+  slope: 4,
+  histogram: 5,
+  glint: 6
+};
+
+const SHADING_MODE_INDEX: Record<ShadingModeId, number> = {
+  macro: 0,
+  glint: 1
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -100,20 +128,27 @@ export class MetalPlateRenderer {
   private device: GPUDevice | null = null;
   private canvasFormat: GPUTextureFormat | null = null;
 
-  private pipeline: GPURenderPipeline | null = null;
-  private bindGroup: GPUBindGroup | null = null;
+  private renderPipeline: GPURenderPipeline | null = null;
+  private renderBindGroup: GPUBindGroup | null = null;
   private uniformBuffer: GPUBuffer | null = null;
   private buildUniformBuffer: GPUBuffer | null = null;
   private envTexture: GPUTexture | null = null;
   private envSampler: GPUSampler | null = null;
   private envMipLevelCount = 1;
   private environmentLoadToken = 0;
+  private slopeTexture: GPUTexture | null = null;
   private slopeSatTextureA: GPUTexture | null = null;
   private slopeSatTextureB: GPUTexture | null = null;
   private slopeSatRowTextureA: GPUTexture | null = null;
   private slopeSatRowTextureB: GPUTexture | null = null;
+  private histCountBuffer: GPUBuffer | null = null;
+  private histPdfBuffer: GPUBuffer | null = null;
+  private histOverflowBuffer: GPUBuffer | null = null;
+  private heightToSlopePipeline: GPUComputePipeline | null = null;
   private satRowPipeline: GPUComputePipeline | null = null;
   private satColumnPipeline: GPUComputePipeline | null = null;
+  private histogramBuildPipeline: GPUComputePipeline | null = null;
+  private histogramNormalizePipeline: GPUComputePipeline | null = null;
   private heightSource = DEFAULT_HEIGHT_WGSL;
 
   private readonly fovDegrees = 36;
@@ -123,7 +158,8 @@ export class MetalPlateRenderer {
   private readonly target: Vec3 = [0, 0, 0];
 
   private runtimeConfig: RuntimeConfig = {
-    debugView: "beauty"
+    debugView: "beauty",
+    shadingMode: "glint"
   };
 
   private snapshot: MetalPlateSnapshot = {
@@ -185,6 +221,10 @@ export class MetalPlateRenderer {
     this.runtimeConfig.debugView = debugView;
   }
 
+  public setShadingMode(shadingMode: ShadingModeId): void {
+    this.runtimeConfig.shadingMode = shadingMode;
+  }
+
   public orbit(deltaX: number, deltaY: number): void {
     this.yaw -= deltaX * 0.006;
     this.pitch = clamp(this.pitch - deltaY * 0.005, -0.24, 1.34);
@@ -239,26 +279,41 @@ export class MetalPlateRenderer {
       };
     }
 
-    const module = device.createShaderModule({
-      label: "micro-sat-row-dynamic-shader",
-      code: this.buildSatRowShader(source)
+    const heightToSlopeModule = device.createShaderModule({
+      label: "micro-height-to-slope-shader",
+      code: buildHeightToSlopeShader(source)
     });
-    const messages = this.dedupeMessages(
-      await this.collectCompilationMessages(module, "build")
-    );
+    const satRowModule = device.createShaderModule({
+      label: "micro-sat-row-dynamic-shader",
+      code: buildSatRowShader(source)
+    });
+
+    const messages = this.dedupeMessages([
+      ...(await this.collectCompilationMessages(heightToSlopeModule, "build")),
+      ...(await this.collectCompilationMessages(satRowModule, "build"))
+    ]);
     if (messages.some((message) => message.level === "error")) {
       return { ok: false, messages };
     }
 
     try {
+      this.heightToSlopePipeline = device.createComputePipeline({
+        label: "micro-height-to-slope-pipeline",
+        layout: "auto",
+        compute: {
+          module: heightToSlopeModule,
+          entryPoint: "cs_height_to_slope"
+        }
+      });
       this.satRowPipeline = device.createComputePipeline({
         label: "micro-sat-row-pipeline",
         layout: "auto",
         compute: {
-          module,
+          module: satRowModule,
           entryPoint: "cs_sat_row"
         }
       });
+
       this.heightSource = source;
       this.rebuildStatistics();
       return { ok: true, messages };
@@ -304,7 +359,7 @@ export class MetalPlateRenderer {
     const tanHalfFov = Math.tan((this.fovDegrees * Math.PI) / 360);
     const lightDirection = normalize3([0.52, 0.78, 0.34]);
 
-    const params = new Float32Array(8 * 4);
+    const params = new Float32Array(FRAME_UNIFORM_VECTORS * 4);
     params.set(
       [
         canvas.width,
@@ -332,6 +387,16 @@ export class MetalPlateRenderer {
       [lightDirection[0], lightDirection[1], lightDirection[2], this.envMipLevelCount - 1],
       28
     );
+    params.set(
+      [
+        SHADING_MODE_INDEX[this.runtimeConfig.shadingMode],
+        HISTOGRAM_TILE_SIZE,
+        HISTOGRAM_BIN_COUNT,
+        HISTOGRAM_TILE_COUNT
+      ],
+      32
+    );
+    params.set([HISTOGRAM_SLOPE_MAX, GLINT_GAIN, GLINT_WINDOW_SCALE, 0], 36);
     device.queue.writeBuffer(uniformBuffer, 0, params);
 
     this.snapshot = this.computeCenterSnapshot(
@@ -357,9 +422,9 @@ export class MetalPlateRenderer {
       ]
     });
 
-    if (this.pipeline && this.bindGroup) {
-      pass.setPipeline(this.pipeline);
-      pass.setBindGroup(0, this.bindGroup);
+    if (this.renderPipeline && this.renderBindGroup) {
+      pass.setPipeline(this.renderPipeline);
+      pass.setBindGroup(0, this.renderBindGroup);
       pass.draw(3, 1, 0, 0);
     }
 
@@ -375,22 +440,33 @@ export class MetalPlateRenderer {
     this.buildUniformBuffer?.destroy();
     this.envTexture?.destroy();
     this.uniformBuffer?.destroy();
+    this.slopeTexture?.destroy();
     this.slopeSatTextureA?.destroy();
     this.slopeSatTextureB?.destroy();
     this.slopeSatRowTextureA?.destroy();
     this.slopeSatRowTextureB?.destroy();
+    this.histCountBuffer?.destroy();
+    this.histPdfBuffer?.destroy();
+    this.histOverflowBuffer?.destroy();
     this.envTexture = null;
     this.uniformBuffer = null;
     this.buildUniformBuffer = null;
     this.envSampler = null;
+    this.slopeTexture = null;
     this.slopeSatTextureA = null;
     this.slopeSatTextureB = null;
     this.slopeSatRowTextureA = null;
     this.slopeSatRowTextureB = null;
-    this.pipeline = null;
+    this.histCountBuffer = null;
+    this.histPdfBuffer = null;
+    this.histOverflowBuffer = null;
+    this.renderPipeline = null;
+    this.renderBindGroup = null;
+    this.heightToSlopePipeline = null;
     this.satRowPipeline = null;
     this.satColumnPipeline = null;
-    this.bindGroup = null;
+    this.histogramBuildPipeline = null;
+    this.histogramNormalizePipeline = null;
     this.context = null;
     this.device = null;
     this.canvas = null;
@@ -408,22 +484,29 @@ export class MetalPlateRenderer {
 
   private createResources(): void {
     const device = this.device as GPUDevice;
+    const histogramTileTotal = HISTOGRAM_TILE_COUNT * HISTOGRAM_TILE_COUNT;
+    const histogramValueCount = histogramTileTotal * HISTOGRAM_BIN_TOTAL;
+
     this.uniformBuffer?.destroy();
     this.buildUniformBuffer?.destroy();
     this.envTexture?.destroy();
+    this.slopeTexture?.destroy();
     this.slopeSatTextureA?.destroy();
     this.slopeSatTextureB?.destroy();
     this.slopeSatRowTextureA?.destroy();
     this.slopeSatRowTextureB?.destroy();
+    this.histCountBuffer?.destroy();
+    this.histPdfBuffer?.destroy();
+    this.histOverflowBuffer?.destroy();
 
     this.uniformBuffer = device.createBuffer({
       label: "metal-plate-uniforms",
-      size: 8 * 16,
+      size: FRAME_UNIFORM_VECTORS * 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     this.buildUniformBuffer = device.createBuffer({
       label: "micro-build-uniforms",
-      size: 16,
+      size: BUILD_UNIFORM_VECTORS * 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
 
@@ -451,6 +534,12 @@ export class MetalPlateRenderer {
       addressModeV: "clamp-to-edge"
     });
 
+    this.slopeTexture = device.createTexture({
+      label: "micro-slope-texture",
+      size: [MICRO_ATLAS_RESOLUTION, MICRO_ATLAS_RESOLUTION, 1],
+      format: "rgba16float",
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
+    });
     this.slopeSatTextureA = device.createTexture({
       label: "micro-sat-a",
       size: [MICRO_ATLAS_RESOLUTION, MICRO_ATLAS_RESOLUTION, 1],
@@ -475,20 +564,44 @@ export class MetalPlateRenderer {
       format: "r32float",
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
     });
+
+    this.histCountBuffer = device.createBuffer({
+      label: "micro-hist-counts",
+      size: histogramValueCount * Uint32Array.BYTES_PER_ELEMENT,
+      usage: GPUBufferUsage.STORAGE
+    });
+    this.histPdfBuffer = device.createBuffer({
+      label: "micro-hist-pdf",
+      size: histogramValueCount * Float32Array.BYTES_PER_ELEMENT,
+      usage: GPUBufferUsage.STORAGE
+    });
+    this.histOverflowBuffer = device.createBuffer({
+      label: "micro-hist-overflow",
+      size: histogramTileTotal * Uint32Array.BYTES_PER_ELEMENT,
+      usage: GPUBufferUsage.STORAGE
+    });
   }
 
   private createPipelines(): void {
     const device = this.device as GPUDevice;
     const renderModule = device.createShaderModule({
       label: "metal-plate-shader",
-      code: this.buildRenderShader()
+      code: RENDER_SHADER
     });
     const satColumnModule = device.createShaderModule({
       label: "micro-sat-column-shader",
-      code: this.buildSatColumnShader()
+      code: SAT_COLUMN_SHADER
+    });
+    const histogramBuildModule = device.createShaderModule({
+      label: "micro-histogram-build-shader",
+      code: BUILD_HISTOGRAM_SHADER
+    });
+    const histogramNormalizeModule = device.createShaderModule({
+      label: "micro-histogram-normalize-shader",
+      code: NORMALIZE_HISTOGRAM_SHADER
     });
 
-    this.pipeline = device.createRenderPipeline({
+    this.renderPipeline = device.createRenderPipeline({
       label: "metal-plate-pipeline",
       layout: "auto",
       vertex: {
@@ -513,36 +626,58 @@ export class MetalPlateRenderer {
         entryPoint: "cs_sat_column"
       }
     });
+    this.histogramBuildPipeline = device.createComputePipeline({
+      label: "micro-histogram-build-pipeline",
+      layout: "auto",
+      compute: {
+        module: histogramBuildModule,
+        entryPoint: "cs_build_histogram"
+      }
+    });
+    this.histogramNormalizePipeline = device.createComputePipeline({
+      label: "micro-histogram-normalize-pipeline",
+      layout: "auto",
+      compute: {
+        module: histogramNormalizeModule,
+        entryPoint: "cs_normalize_histogram"
+      }
+    });
   }
 
   private refreshBindGroup(): void {
     const device = this.device;
-    const pipeline = this.pipeline;
+    const renderPipeline = this.renderPipeline;
     const uniformBuffer = this.uniformBuffer;
     const envTexture = this.envTexture;
     const envSampler = this.envSampler;
     const slopeSatTextureA = this.slopeSatTextureA;
     const slopeSatTextureB = this.slopeSatTextureB;
+    const slopeTexture = this.slopeTexture;
+    const histPdfBuffer = this.histPdfBuffer;
     if (
       !device ||
-      !pipeline ||
+      !renderPipeline ||
       !uniformBuffer ||
       !envTexture ||
       !envSampler ||
       !slopeSatTextureA ||
-      !slopeSatTextureB
+      !slopeSatTextureB ||
+      !slopeTexture ||
+      !histPdfBuffer
     ) {
       return;
     }
 
-    this.bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
+    this.renderBindGroup = device.createBindGroup({
+      layout: renderPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: uniformBuffer } },
         { binding: 1, resource: envTexture.createView() },
         { binding: 2, resource: envSampler },
         { binding: 3, resource: slopeSatTextureA.createView() },
-        { binding: 4, resource: slopeSatTextureB.createView() }
+        { binding: 4, resource: slopeSatTextureB.createView() },
+        { binding: 5, resource: slopeTexture.createView() },
+        { binding: 6, resource: { buffer: histPdfBuffer } }
       ]
     });
   }
@@ -550,21 +685,35 @@ export class MetalPlateRenderer {
   private rebuildStatistics(): void {
     const device = this.device;
     const buildUniformBuffer = this.buildUniformBuffer;
-    const satRowPipeline = this.satRowPipeline;
-    const satColumnPipeline = this.satColumnPipeline;
+    const slopeTexture = this.slopeTexture;
     const slopeSatTextureA = this.slopeSatTextureA;
     const slopeSatTextureB = this.slopeSatTextureB;
     const slopeSatRowTextureA = this.slopeSatRowTextureA;
     const slopeSatRowTextureB = this.slopeSatRowTextureB;
+    const histCountBuffer = this.histCountBuffer;
+    const histPdfBuffer = this.histPdfBuffer;
+    const histOverflowBuffer = this.histOverflowBuffer;
+    const heightToSlopePipeline = this.heightToSlopePipeline;
+    const satRowPipeline = this.satRowPipeline;
+    const satColumnPipeline = this.satColumnPipeline;
+    const histogramBuildPipeline = this.histogramBuildPipeline;
+    const histogramNormalizePipeline = this.histogramNormalizePipeline;
     if (
       !device ||
       !buildUniformBuffer ||
-      !satRowPipeline ||
-      !satColumnPipeline ||
+      !slopeTexture ||
       !slopeSatTextureA ||
       !slopeSatTextureB ||
       !slopeSatRowTextureA ||
-      !slopeSatRowTextureB
+      !slopeSatRowTextureB ||
+      !histCountBuffer ||
+      !histPdfBuffer ||
+      !histOverflowBuffer ||
+      !heightToSlopePipeline ||
+      !satRowPipeline ||
+      !satColumnPipeline ||
+      !histogramBuildPipeline ||
+      !histogramNormalizePipeline
     ) {
       return;
     }
@@ -576,41 +725,106 @@ export class MetalPlateRenderer {
         MICRO_ATLAS_RESOLUTION,
         MICRO_ATLAS_CELLS,
         MICRO_CELL_MM,
-        0
+        HISTOGRAM_TILE_COUNT,
+        HISTOGRAM_TILE_SIZE,
+        HISTOGRAM_BIN_COUNT,
+        HISTOGRAM_SLOPE_MAX,
+        HISTOGRAM_TILE_SIZE * MICRO_CELL_MM
       ])
     );
 
     const encoder = device.createCommandEncoder({ label: "micro-statistics-build" });
-    const pass = encoder.beginComputePass({ label: "micro-statistics-pass" });
 
-    const rowBindGroup = device.createBindGroup({
-      layout: satRowPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: slopeSatRowTextureA.createView() },
-        { binding: 1, resource: slopeSatRowTextureB.createView() },
-        { binding: 2, resource: { buffer: buildUniformBuffer } }
-      ]
+    const preprocessPass = encoder.beginComputePass({ label: "micro-preprocess-pass" });
+    preprocessPass.setPipeline(heightToSlopePipeline);
+    preprocessPass.setBindGroup(
+      0,
+      device.createBindGroup({
+        layout: heightToSlopePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: slopeTexture.createView() },
+          { binding: 1, resource: { buffer: buildUniformBuffer } }
+        ]
+      })
+    );
+    preprocessPass.dispatchWorkgroups(
+      Math.ceil(MICRO_ATLAS_RESOLUTION / 8),
+      Math.ceil(MICRO_ATLAS_RESOLUTION / 8),
+      1
+    );
+
+    preprocessPass.setPipeline(satRowPipeline);
+    preprocessPass.setBindGroup(
+      0,
+      device.createBindGroup({
+        layout: satRowPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: slopeSatRowTextureA.createView() },
+          { binding: 1, resource: slopeSatRowTextureB.createView() },
+          { binding: 2, resource: { buffer: buildUniformBuffer } }
+        ]
+      })
+    );
+    preprocessPass.dispatchWorkgroups(Math.ceil(MICRO_ATLAS_RESOLUTION / 64), 1, 1);
+    preprocessPass.end();
+
+    const histogramBuildPass = encoder.beginComputePass({
+      label: "micro-histogram-build-pass"
     });
-    pass.setPipeline(satRowPipeline);
-    pass.setBindGroup(0, rowBindGroup);
-    const groups = Math.ceil(MICRO_ATLAS_RESOLUTION / 64);
-    pass.dispatchWorkgroups(groups, 1, 1);
+    histogramBuildPass.setPipeline(satColumnPipeline);
+    histogramBuildPass.setBindGroup(
+      0,
+      device.createBindGroup({
+        layout: satColumnPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: slopeSatRowTextureA.createView() },
+          { binding: 1, resource: slopeSatRowTextureB.createView() },
+          { binding: 2, resource: slopeSatTextureA.createView() },
+          { binding: 3, resource: slopeSatTextureB.createView() },
+          { binding: 4, resource: { buffer: buildUniformBuffer } }
+        ]
+      })
+    );
+    histogramBuildPass.dispatchWorkgroups(Math.ceil(MICRO_ATLAS_RESOLUTION / 64), 1, 1);
 
-    const columnBindGroup = device.createBindGroup({
-      layout: satColumnPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: slopeSatRowTextureA.createView() },
-        { binding: 1, resource: slopeSatRowTextureB.createView() },
-        { binding: 2, resource: slopeSatTextureA.createView() },
-        { binding: 3, resource: slopeSatTextureB.createView() },
-        { binding: 4, resource: { buffer: buildUniformBuffer } }
-      ]
+    histogramBuildPass.setPipeline(histogramBuildPipeline);
+    histogramBuildPass.setBindGroup(
+      0,
+      device.createBindGroup({
+        layout: histogramBuildPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: slopeTexture.createView() },
+          { binding: 1, resource: { buffer: histCountBuffer } },
+          { binding: 2, resource: { buffer: histOverflowBuffer } },
+          { binding: 3, resource: { buffer: buildUniformBuffer } }
+        ]
+      })
+    );
+    histogramBuildPass.dispatchWorkgroups(HISTOGRAM_TILE_COUNT, HISTOGRAM_TILE_COUNT, 1);
+    histogramBuildPass.end();
+
+    const histogramNormalizePass = encoder.beginComputePass({
+      label: "micro-histogram-normalize-pass"
     });
-    pass.setPipeline(satColumnPipeline);
-    pass.setBindGroup(0, columnBindGroup);
-    pass.dispatchWorkgroups(groups, 1, 1);
+    histogramNormalizePass.setPipeline(histogramNormalizePipeline);
+    histogramNormalizePass.setBindGroup(
+      0,
+      device.createBindGroup({
+        layout: histogramNormalizePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: histCountBuffer } },
+          { binding: 1, resource: { buffer: histPdfBuffer } },
+          { binding: 2, resource: { buffer: buildUniformBuffer } }
+        ]
+      })
+    );
+    histogramNormalizePass.dispatchWorkgroups(
+      HISTOGRAM_TILE_COUNT * HISTOGRAM_TILE_COUNT,
+      1,
+      1
+    );
+    histogramNormalizePass.end();
 
-    pass.end();
     device.queue.submit([encoder.finish()]);
   }
 
@@ -822,515 +1036,5 @@ export class MetalPlateRenderer {
       }
     }
     return deduped;
-  }
-
-  private buildRenderShader(): string {
-    return `
-const PI = 3.141592653589793;
-const HEAT_A = vec3<f32>(0.03, 0.12, 0.18);
-const HEAT_B = vec3<f32>(0.16, 0.54, 0.73);
-const HEAT_C = vec3<f32>(0.95, 0.72, 0.29);
-const HEAT_D = vec3<f32>(1.0, 0.35, 0.1);
-
-@group(0) @binding(0) var<uniform> params: array<vec4<f32>, 8>;
-@group(0) @binding(1) var envTex: texture_2d<f32>;
-@group(0) @binding(2) var envSampler: sampler;
-@group(0) @binding(3) var slopeSatTexA: texture_2d<f32>;
-@group(0) @binding(4) var slopeSatTexB: texture_2d<f32>;
-
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-};
-
-struct Hit {
-  valid: bool,
-  t: f32,
-  position: vec3<f32>,
-};
-
-struct FootprintInfo {
-  spanWorld: vec2<f32>,
-  sizeMm: f32,
-  cellsCovered: f32,
-  aspect: f32,
-};
-
-struct SlopeStats {
-  meanNormal: vec3<f32>,
-  meanSlope: vec2<f32>,
-  alpha: vec2<f32>,
-  anisotropy: f32,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VSOut {
-  var positions = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -3.0),
-    vec2<f32>(-1.0, 1.0),
-    vec2<f32>(3.0, 1.0)
-  );
-  var out: VSOut;
-  out.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
-  return out;
-}
-
-fn ray_dir_for_pixel(pixel: vec2<f32>) -> vec3<f32> {
-  let resolution = max(params[0].xy, vec2<f32>(1.0, 1.0));
-  let aspect = resolution.x / resolution.y;
-  let ndc = vec2<f32>(
-    (pixel.x / resolution.x) * 2.0 - 1.0,
-    1.0 - (pixel.y / resolution.y) * 2.0
-  );
-  let forward = params[5].xyz;
-  let right = params[3].xyz;
-  let up = params[4].xyz;
-  let tanHalfFov = params[5].w;
-  return normalize(
-    forward + right * ndc.x * aspect * tanHalfFov + up * ndc.y * tanHalfFov
-  );
-}
-
-fn intersect_plate(ro: vec3<f32>, rd: vec3<f32>) -> Hit {
-  var hit = Hit(false, 0.0, vec3<f32>(0.0, 0.0, 0.0));
-  if (abs(rd.y) < 1e-6) {
-    return hit;
-  }
-
-  let t = -ro.y / rd.y;
-  if (t <= 0.0) {
-    return hit;
-  }
-
-  let p = ro + rd * t;
-  let extent = params[1].x;
-  if (abs(p.x) > extent || abs(p.z) > extent) {
-    return hit;
-  }
-
-  hit.valid = true;
-  hit.t = t;
-  hit.position = p;
-  return hit;
-}
-
-fn estimate_footprint(fragCoord: vec2<f32>, ro: vec3<f32>, centerHit: Hit) -> FootprintInfo {
-  let tanHalfFov = params[5].w;
-  let resolution = max(params[0].xy, vec2<f32>(1.0, 1.0));
-  let fallback = (2.0 * centerHit.t * tanHalfFov) / resolution.y;
-
-  let hitX = intersect_plate(ro, ray_dir_for_pixel(fragCoord + vec2<f32>(1.0, 0.0)));
-  let hitY = intersect_plate(ro, ray_dir_for_pixel(fragCoord + vec2<f32>(0.0, 1.0)));
-
-  var deltaX = vec2<f32>(fallback, 0.0);
-  var deltaY = vec2<f32>(0.0, fallback);
-  if (hitX.valid) {
-    deltaX = hitX.position.xz - centerHit.position.xz;
-  }
-  if (hitY.valid) {
-    deltaY = hitY.position.xz - centerHit.position.xz;
-  }
-
-  let spanWorld = vec2<f32>(
-    max(abs(deltaX.x) + abs(deltaY.x), fallback),
-    max(abs(deltaX.y) + abs(deltaY.y), fallback)
-  );
-  let sizeMm = sqrt(max(spanWorld.x * spanWorld.y, 1e-8));
-  let cells = sizeMm / max(params[1].y, 1e-4);
-  let aspect = max(spanWorld.x, spanWorld.y) / max(min(spanWorld.x, spanWorld.y), 1e-6);
-  return FootprintInfo(spanWorld, sizeMm, cells, aspect);
-}
-
-fn sat_load_a(coord: vec2<i32>, maxCoord: i32) -> vec4<f32> {
-  if (coord.x < 0 || coord.y < 0 || coord.x > maxCoord || coord.y > maxCoord) {
-    return vec4<f32>(0.0);
-  }
-  return textureLoad(slopeSatTexA, coord, 0);
-}
-
-fn sat_load_b(coord: vec2<i32>, maxCoord: i32) -> f32 {
-  if (coord.x < 0 || coord.y < 0 || coord.x > maxCoord || coord.y > maxCoord) {
-    return 0.0;
-  }
-  return textureLoad(slopeSatTexB, coord, 0).x;
-}
-
-fn sat_rect_sum_a(minCoord: vec2<i32>, maxCoordRect: vec2<i32>, maxCoord: i32) -> vec4<f32> {
-  let a = sat_load_a(maxCoordRect, maxCoord);
-  let b = sat_load_a(vec2<i32>(minCoord.x - 1, maxCoordRect.y), maxCoord);
-  let c = sat_load_a(vec2<i32>(maxCoordRect.x, minCoord.y - 1), maxCoord);
-  let d = sat_load_a(vec2<i32>(minCoord.x - 1, minCoord.y - 1), maxCoord);
-  return a - b - c + d;
-}
-
-fn sat_rect_sum_b(minCoord: vec2<i32>, maxCoordRect: vec2<i32>, maxCoord: i32) -> f32 {
-  let a = sat_load_b(maxCoordRect, maxCoord);
-  let b = sat_load_b(vec2<i32>(minCoord.x - 1, maxCoordRect.y), maxCoord);
-  let c = sat_load_b(vec2<i32>(maxCoordRect.x, minCoord.y - 1), maxCoord);
-  let d = sat_load_b(vec2<i32>(minCoord.x - 1, minCoord.y - 1), maxCoord);
-  return a - b - c + d;
-}
-
-fn normal_from_slope(sx: f32, sy: f32) -> vec3<f32> {
-  return normalize(vec3<f32>(-sx, 1.0, -sy));
-}
-
-fn tangent_from_slope(sx: f32) -> vec3<f32> {
-  return normalize(vec3<f32>(1.0, sx, 0.0));
-}
-
-fn bitangent_from_slope(sy: f32) -> vec3<f32> {
-  return normalize(vec3<f32>(0.0, sy, 1.0));
-}
-
-fn slope_stats_at(p: vec2<f32>, footprint: FootprintInfo) -> SlopeStats {
-  let atlasRes = max(i32(params[1].w), 1);
-  let maxCoord = atlasRes - 1;
-  let atlasCells = max(params[6].w, 1.0);
-  let texelsPerCell = params[1].w / atlasCells;
-  let cellUv = fract(p / max(params[1].y, 1e-4));
-  let centerCell = floor(atlasCells * 0.5);
-  let center = (vec2<f32>(centerCell, centerCell) + cellUv) * texelsPerCell - vec2<f32>(0.5, 0.5);
-  let maxRadiusCells = max(atlasCells * 0.35, 1.0);
-  let filterInflation = mix(1.35, 1.85, clamp(footprint.cellsCovered / 6.0, 0.0, 1.0));
-  let halfExtentCells = clamp(
-    (footprint.spanWorld * 0.5) / max(params[1].y, 1e-4) * filterInflation +
-      vec2<f32>(0.18, 0.18),
-    vec2<f32>(0.25, 0.25),
-    vec2<f32>(maxRadiusCells, maxRadiusCells)
-  );
-  let halfExtentTexels = halfExtentCells * texelsPerCell;
-
-  var minCoord = clamp(
-    vec2<i32>(floor(center - halfExtentTexels)),
-    vec2<i32>(0, 0),
-    vec2<i32>(maxCoord, maxCoord)
-  );
-  var maxCoordRect = clamp(
-    vec2<i32>(ceil(center + halfExtentTexels)),
-    vec2<i32>(0, 0),
-    vec2<i32>(maxCoord, maxCoord)
-  );
-  if (footprint.cellsCovered > atlasCells * 0.55) {
-    minCoord = vec2<i32>(0, 0);
-    maxCoordRect = vec2<i32>(maxCoord, maxCoord);
-  }
-
-  let area = max(
-    f32((maxCoordRect.x - minCoord.x + 1) * (maxCoordRect.y - minCoord.y + 1)),
-    1.0
-  );
-  let sumsA = sat_rect_sum_a(minCoord, maxCoordRect, maxCoord);
-  let sumB = sat_rect_sum_b(minCoord, maxCoordRect, maxCoord);
-  let meanSx = sumsA.x / area;
-  let meanSy = sumsA.y / area;
-  let meanSx2 = sumsA.z / area;
-  let meanSy2 = sumsA.w / area;
-  let meanSxSy = sumB / area;
-  let varX = max(meanSx2 - meanSx * meanSx, 0.0);
-  let varY = max(meanSy2 - meanSy * meanSy, 0.0);
-  let coverageBlur = clamp(sqrt(max(footprint.cellsCovered, 0.0)) * 0.05, 0.0, 0.22);
-  let alphaX = clamp(params[6].x + sqrt(varX) * 0.85 + coverageBlur, params[6].x, 0.94);
-  let alphaY = clamp(params[6].x + sqrt(varY) * 0.85 + coverageBlur, params[6].x, 0.94);
-  let anisotropy = (alphaX - alphaY) / max(alphaX + alphaY, 1e-5);
-  return SlopeStats(
-    normal_from_slope(meanSx, meanSy),
-    vec2<f32>(meanSx, meanSy),
-    vec2<f32>(alphaX, alphaY),
-    anisotropy
-  );
-}
-
-fn hash12(p: vec2<f32>) -> f32 {
-  let h = dot(p, vec2<f32>(127.1, 311.7));
-  return fract(sin(h) * 43758.5453123);
-}
-
-fn filtered_slope_stats(p: vec2<f32>, footprint: FootprintInfo, fragCoord: vec2<f32>) -> SlopeStats {
-  let baseStats = slope_stats_at(p, footprint);
-  let shimmerRisk = smoothstep(0.22, 1.85, footprint.cellsCovered) *
-    (1.0 - smoothstep(1.85, 4.4, footprint.cellsCovered));
-  if (shimmerRisk <= 0.02) {
-    return baseStats;
-  }
-
-  let angle = hash12(floor(fragCoord.xy)) * PI * 2.0;
-  let cosA = cos(angle);
-  let sinA = sin(angle);
-  let baseRadius = min(
-    footprint.spanWorld * 0.3,
-    vec2<f32>(params[1].y * 0.65, params[1].y * 0.65)
-  ) * shimmerRisk;
-  var normalSum = baseStats.meanNormal;
-  var slopeSum = baseStats.meanSlope;
-  var alphaSum = baseStats.alpha;
-  var anisoSum = baseStats.anisotropy;
-  var weightSum = 1.0;
-  let offsets = array<vec2<f32>, 4>(
-    vec2<f32>(-0.42, -0.18),
-    vec2<f32>(0.31, -0.37),
-    vec2<f32>(-0.24, 0.39),
-    vec2<f32>(0.45, 0.21)
-  );
-
-  for (var i = 0; i < 4; i = i + 1) {
-    let offset = offsets[i];
-    let rotated = vec2<f32>(
-      offset.x * cosA - offset.y * sinA,
-      offset.x * sinA + offset.y * cosA
-    );
-    let sampleStats = slope_stats_at(p + rotated * baseRadius, footprint);
-    let w = 0.55;
-    normalSum = normalSum + sampleStats.meanNormal * w;
-    slopeSum = slopeSum + sampleStats.meanSlope * w;
-    alphaSum = alphaSum + sampleStats.alpha * w;
-    anisoSum = anisoSum + sampleStats.anisotropy * w;
-    weightSum = weightSum + w;
-  }
-
-  return SlopeStats(
-    normalize(normalSum / weightSum),
-    slopeSum / weightSum,
-    alphaSum / weightSum,
-    anisoSum / weightSum
-  );
-}
-
-fn decode_rgbe(encoded: vec4<f32>) -> vec3<f32> {
-  let rgbe = encoded * 255.0;
-  if (rgbe.w <= 0.0) {
-    return vec3<f32>(0.0);
-  }
-  let scale = exp2(rgbe.w - 128.0) / 256.0;
-  return rgbe.xyz * scale;
-}
-
-fn sample_env(direction: vec3<f32>, lod: f32) -> vec3<f32> {
-  let dir = normalize(direction);
-  let phi = atan2(dir.z, dir.x);
-  let theta = acos(clamp(dir.y, -1.0, 1.0));
-  let uv = vec2<f32>(fract(phi / (2.0 * PI) + 0.5), clamp(theta / PI, 0.0, 1.0));
-  let maxLod = max(params[7].w, 0.0);
-  return decode_rgbe(textureSampleLevel(envTex, envSampler, uv, clamp(lod, 0.0, maxLod))) * params[6].y;
-}
-
-fn fresnel_schlick(cosTheta: f32, f0: vec3<f32>) -> vec3<f32> {
-  return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - cosTheta, 5.0);
-}
-
-fn distribution_ggx_aniso(
-  n: vec3<f32>,
-  h: vec3<f32>,
-  t: vec3<f32>,
-  b: vec3<f32>,
-  alpha: vec2<f32>
-) -> f32 {
-  let ndh = max(dot(n, h), 1e-4);
-  let tdh = dot(t, h);
-  let bdh = dot(b, h);
-  let invAx = 1.0 / max(alpha.x, 1e-4);
-  let invAy = 1.0 / max(alpha.y, 1e-4);
-  let denom = (tdh * invAx) * (tdh * invAx) + (bdh * invAy) * (bdh * invAy) + ndh * ndh;
-  return 1.0 / max(PI * alpha.x * alpha.y * denom * denom, 1e-5);
-}
-
-fn smith_g1_aniso(
-  n: vec3<f32>,
-  v: vec3<f32>,
-  t: vec3<f32>,
-  b: vec3<f32>,
-  alpha: vec2<f32>
-) -> f32 {
-  let ndv = max(dot(n, v), 1e-4);
-  let tdv = dot(t, v) * alpha.x;
-  let bdv = dot(b, v) * alpha.y;
-  let root = sqrt(ndv * ndv + tdv * tdv + bdv * bdv);
-  return (2.0 * ndv) / max(ndv + root, 1e-4);
-}
-
-fn geometry_smith_aniso(
-  n: vec3<f32>,
-  v: vec3<f32>,
-  l: vec3<f32>,
-  t: vec3<f32>,
-  b: vec3<f32>,
-  alpha: vec2<f32>
-) -> f32 {
-  return smith_g1_aniso(n, v, t, b, alpha) * smith_g1_aniso(n, l, t, b, alpha);
-}
-
-fn heatmap(t: f32) -> vec3<f32> {
-  let x = clamp(t, 0.0, 1.0);
-  let c0 = mix(HEAT_A, HEAT_B, smoothstep(0.0, 0.35, x));
-  let c1 = mix(c0, HEAT_C, smoothstep(0.28, 0.72, x));
-  return mix(c1, HEAT_D, smoothstep(0.68, 1.0, x));
-}
-
-fn tonemap_aces(color: vec3<f32>) -> vec3<f32> {
-  let a = 2.51;
-  let b = 0.03;
-  let c = 2.43;
-  let d = 0.59;
-  let e = 0.14;
-  return clamp(
-    (color * (a * color + b)) / (color * (c * color + d) + e),
-    vec3<f32>(0.0),
-    vec3<f32>(1.0)
-  );
-}
-
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-  let ro = params[2].xyz;
-  let rd = ray_dir_for_pixel(fragCoord.xy);
-  let plateHit = intersect_plate(ro, rd);
-  let debugView = i32(params[0].w + 0.5);
-
-  if (!plateHit.valid) {
-    let bg = tonemap_aces(sample_env(rd, 0.0));
-    return vec4<f32>(pow(bg, vec3<f32>(1.0 / 2.2)), 1.0);
-  }
-
-  let footprint = estimate_footprint(fragCoord.xy, ro, plateHit);
-  let slopeStats = filtered_slope_stats(plateHit.position.xz, footprint, fragCoord.xy);
-  let n = slopeStats.meanNormal;
-  let v = normalize(ro - plateHit.position);
-  let l = normalize(params[7].xyz);
-  let h = normalize(v + l);
-
-  if (debugView == 1) {
-    let band = heatmap(clamp(footprint.sizeMm / 1.4, 0.0, 1.0));
-    return vec4<f32>(pow(band, vec3<f32>(1.0 / 2.2)), 1.0);
-  }
-
-  if (debugView == 2) {
-    let cov = heatmap(clamp(footprint.cellsCovered / 6.0, 0.0, 1.0));
-    return vec4<f32>(pow(cov, vec3<f32>(1.0 / 2.2)), 1.0);
-  }
-
-  if (debugView == 3) {
-    let encoded = n * 0.5 + vec3<f32>(0.5);
-    return vec4<f32>(pow(encoded, vec3<f32>(1.0 / 2.2)), 1.0);
-  }
-
-  let baseColor = vec3<f32>(0.96, 0.88, 0.72);
-  let tangent = tangent_from_slope(slopeStats.meanSlope.x);
-  let bitangent = bitangent_from_slope(slopeStats.meanSlope.y);
-  let ndv = max(dot(n, v), 0.0);
-  let ndl = max(dot(n, l), 0.0);
-  let grazingLift = pow(1.0 - ndv, 2.0) * 0.16;
-  let shadedAlpha = min(
-    slopeStats.alpha + vec2<f32>(grazingLift, grazingLift),
-    vec2<f32>(0.96, 0.96)
-  );
-  let fresnel = fresnel_schlick(max(dot(h, v), 0.0), baseColor);
-  let d = distribution_ggx_aniso(n, h, tangent, bitangent, shadedAlpha);
-  let g = geometry_smith_aniso(n, v, l, tangent, bitangent, shadedAlpha);
-  let directSpec = (d * g * fresnel) / max(4.0 * ndv * ndl, 1e-5);
-
-  let isoRough = sqrt(shadedAlpha.x * shadedAlpha.y);
-  let envBlur = clamp(
-    max(
-      isoRough,
-      clamp((footprint.cellsCovered - 0.85) * 0.12, 0.0, 0.32) +
-        abs(slopeStats.anisotropy) * 0.12
-    ),
-    0.0,
-    1.0
-  );
-  let envLod = envBlur * max(params[7].w, 0.0);
-  let reflectDir = reflect(-v, n);
-  let blurMix = envBlur * envBlur * 0.88;
-  let envReflect = normalize(mix(reflectDir, n, blurMix));
-  let envSpec = sample_env(envReflect, envLod) * fresnel;
-  let grazing = sample_env(n, min(envLod + 1.0, max(params[7].w, 0.0))) * 0.05 * baseColor;
-  let direct = directSpec * ndl * params[6].z;
-  let edgeMask = smoothstep(params[1].x, params[1].x - 1.6, max(abs(plateHit.position.x), abs(plateHit.position.z)));
-
-  var color = envSpec + grazing + direct;
-  color = mix(color, color * 0.58, edgeMask);
-  color = tonemap_aces(color);
-  color = pow(color, vec3<f32>(1.0 / 2.2));
-  return vec4<f32>(color, 1.0);
-}
-`;
-  }
-
-  private buildSatRowShader(heightCode: string): string {
-    return `
-${heightCode}
-
-@group(0) @binding(0) var satRowAOut: texture_storage_2d<rgba32float, write>;
-@group(0) @binding(1) var satRowBOut: texture_storage_2d<r32float, write>;
-@group(0) @binding(2) var<uniform> buildParams: array<vec4<f32>, 1>;
-
-fn atlas_world_position(coord: vec2<f32>) -> vec2<f32> {
-  let resolution = max(buildParams[0].x, 1.0);
-  let totalSize = buildParams[0].y * buildParams[0].z;
-  let uv = (coord + vec2<f32>(0.5, 0.5)) / resolution;
-  return uv * totalSize;
-}
-
-@compute @workgroup_size(64, 1, 1)
-fn cs_sat_row(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let resolution = u32(buildParams[0].x);
-  if (gid.x >= resolution) {
-    return;
-  }
-
-  let y = i32(gid.x);
-  let maxCoord = i32(resolution - 1u);
-  let texelWorld = (buildParams[0].y * buildParams[0].z) / max(f32(resolution), 1.0);
-  let invSlopeScale = 1.0 / max(2.0 * texelWorld, 1e-6);
-  var sumA = vec4<f32>(0.0);
-  var sumB = 0.0;
-
-  for (var x = 0; x <= maxCoord; x = x + 1) {
-    let p = atlas_world_position(vec2<f32>(f32(x), f32(y)));
-    let hL = height(p - vec2<f32>(texelWorld, 0.0));
-    let hR = height(p + vec2<f32>(texelWorld, 0.0));
-    let hD = height(p - vec2<f32>(0.0, texelWorld));
-    let hU = height(p + vec2<f32>(0.0, texelWorld));
-    let sx = (hR - hL) * invSlopeScale;
-    let sy = (hU - hD) * invSlopeScale;
-
-    sumA = sumA + vec4<f32>(sx, sy, sx * sx, sy * sy);
-    sumB = sumB + sx * sy;
-    textureStore(satRowAOut, vec2<i32>(x, y), sumA);
-    textureStore(satRowBOut, vec2<i32>(x, y), vec4<f32>(sumB, 0.0, 0.0, 1.0));
-  }
-}
-`;
-  }
-
-  private buildSatColumnShader(): string {
-    return `
-@group(0) @binding(0) var satRowAIn: texture_2d<f32>;
-@group(0) @binding(1) var satRowBIn: texture_2d<f32>;
-@group(0) @binding(2) var satOutA: texture_storage_2d<rgba32float, write>;
-@group(0) @binding(3) var satOutB: texture_storage_2d<r32float, write>;
-@group(0) @binding(4) var<uniform> buildParams: array<vec4<f32>, 1>;
-
-@compute @workgroup_size(64, 1, 1)
-fn cs_sat_column(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let resolution = u32(buildParams[0].x);
-  if (gid.x >= resolution) {
-    return;
-  }
-
-  let x = i32(gid.x);
-  let maxCoord = i32(resolution - 1u);
-  var sumA = vec4<f32>(0.0);
-  var sumB = 0.0;
-
-  for (var y = 0; y <= maxCoord; y = y + 1) {
-    let rowA = textureLoad(satRowAIn, vec2<i32>(x, y), 0);
-    let rowB = textureLoad(satRowBIn, vec2<i32>(x, y), 0).x;
-    sumA = sumA + rowA;
-    sumB = sumB + rowB;
-    textureStore(satOutA, vec2<i32>(x, y), sumA);
-    textureStore(satOutB, vec2<i32>(x, y), vec4<f32>(sumB, 0.0, 0.0, 1.0));
-  }
-}
-`;
   }
 }

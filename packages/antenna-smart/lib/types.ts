@@ -16,11 +16,25 @@ export type PhoneRibFeature = PhoneFrameFeature & {
   offset: number;
 };
 
+export type PhoneMidFramePocket = {
+  label: string;
+  offset: number;
+  height: number;
+  inset: number;
+  depth: number;
+};
+
+export type PhoneMidFrameFeature = {
+  gap: number;
+  pockets: PhoneMidFramePocket[];
+};
+
 export type PhoneConfig = {
   frame: {
     thickness: number;
     seams: PhoneFrameFeature[];
     ribs: PhoneRibFeature[];
+    midFrame: PhoneMidFrameFeature;
   };
 };
 

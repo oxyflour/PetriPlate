@@ -363,6 +363,10 @@ code {
   background: #ffd36a;
 }
 
+.legend-chip.pocket {
+  background: #61d5a3;
+}
+
 @media (max-width: 1060px) {
   .workspace {
     grid-template-columns: 1fr;

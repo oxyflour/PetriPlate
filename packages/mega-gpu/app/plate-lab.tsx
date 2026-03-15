@@ -14,7 +14,12 @@ import {
   DEFAULT_HEIGHT_WGSL,
   HEIGHT_PRESETS
 } from "../src/renderer/defaultHeight";
-import { DEBUG_VIEWS, type DebugViewId } from "../src/renderer/presets";
+import {
+  DEBUG_VIEWS,
+  SHADING_MODES,
+  type DebugViewId,
+  type ShadingModeId
+} from "../src/renderer/presets";
 import {
   DEFAULT_CAMERA_DISTANCE_MM,
   DEFAULT_ENVIRONMENT_NAME,
@@ -77,6 +82,7 @@ export default function PlateLab() {
   const [runtimeState, setRuntimeState] = useState<RuntimeState>("booting");
   const [runtimeMessage, setRuntimeMessage] = useState<string>("Initializing WebGPU.");
   const [compileState, setCompileState] = useState<CompileState>("idle");
+  const [shadingMode, setShadingMode] = useState<ShadingModeId>("glint");
   const [debugView, setDebugView] = useState<DebugViewId>("beauty");
   const [snapshot, setSnapshot] = useState<MetalPlateSnapshot>(EMPTY_SNAPSHOT);
   const [zoomDistance, setZoomDistance] = useState<number>(DEFAULT_CAMERA_DISTANCE_MM);
@@ -139,7 +145,7 @@ export default function PlateLab() {
       }
 
       setRuntimeState("ready");
-      setRuntimeMessage("Edit WGSL and rebuild the micro-height statistics in real time.");
+      setRuntimeMessage("Edit WGSL and rebuild macro moments plus the glint histogram in real time.");
       addLog("info", "WebGPU initialized.");
 
       const loop = (now: number) => {
@@ -182,6 +188,10 @@ export default function PlateLab() {
   }, [debugView]);
 
   useEffect(() => {
+    rendererRef.current?.setShadingMode(shadingMode);
+  }, [shadingMode]);
+
+  useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer || runtimeState !== "ready") {
       return;
@@ -200,7 +210,7 @@ export default function PlateLab() {
         addLog("error", "WGSL compile failed. Keeping previous statistics.");
       } else {
         setCompileState("ok");
-        addLog("info", "WGSL compiled. Rebuilt slope moments.");
+        addLog("info", "WGSL compiled. Rebuilt slope moments and glint histogram.");
       }
 
       for (const message of result.messages) {
@@ -325,6 +335,10 @@ export default function PlateLab() {
     () => HEIGHT_PRESETS.find((preset) => preset.id === presetId),
     [presetId]
   );
+  const activeShadingMode = useMemo(
+    () => SHADING_MODES.find((mode) => mode.id === shadingMode),
+    [shadingMode]
+  );
 
   const statusLabel = useMemo(() => {
     if (runtimeState === "booting") {
@@ -362,8 +376,9 @@ export default function PlateLab() {
           <h1>WGSL Height Field Authoring</h1>
           <p className="topbar-copy">
             Edit <code>fn height(p: vec2&lt;f32&gt;) -&gt; f32</code> in millimeters.
-            The right viewport recompiles the micro-height statistics and updates the
-            filtered metal shading in real time.
+            The right viewport rebuilds the macro SAT baseline plus the v0 glint
+            histogram path, so you can A/B the two shading modes against the same
+            procedural height field.
           </p>
         </div>
         <div className={`status-pill ${isErrorState ? "error" : ""}`}>{statusLabel}</div>
@@ -466,6 +481,26 @@ export default function PlateLab() {
             </div>
 
             <div className="toolbar-group">
+              <span className="panel-label">Shading</span>
+              <div className="segmented">
+                {SHADING_MODES.map((mode) => (
+                  <button
+                    key={mode.id}
+                    type="button"
+                    className={mode.id === shadingMode ? "selected" : ""}
+                    onClick={() => setShadingMode(mode.id)}
+                  >
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+              <div className="toolbar-note toolbar-note-compact">
+                <strong>{activeShadingMode?.label ?? "Glint"}</strong>
+                <span>{activeShadingMode?.description ?? runtimeMessage}</span>
+              </div>
+            </div>
+
+            <div className="toolbar-group">
               <span className="panel-label">Debug View</span>
               <div className="segmented">
                 {DEBUG_VIEWS.map((view) => (
@@ -526,7 +561,7 @@ export default function PlateLab() {
                 <strong>{snapshot.centerRoughness.toFixed(3)}</strong>
               </article>
               <article>
-                <span>Anisotropy</span>
+                <span>Footprint Aspect</span>
                 <strong>{snapshot.centerAspect.toFixed(2)}</strong>
               </article>
             </div>
@@ -534,6 +569,7 @@ export default function PlateLab() {
             <div className="viewport-overlay">
               <span>Plate: 50 mm x 50 mm</span>
               <span>Input: WGSL height field</span>
+              <span>Mode: {activeShadingMode?.label ?? "Glint"}</span>
               <span>HDRI: {environmentLabel}</span>
               <span>Drag in viewport to orbit</span>
             </div>

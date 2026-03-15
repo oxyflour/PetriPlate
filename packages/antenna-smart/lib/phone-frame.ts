@@ -20,7 +20,9 @@ type PhoneFrameDagNodes = {
   frameSection: CrossSectionInstance;
   innerVolume: ManifoldInstance;
   innerBottom: ManifoldInstance;
-  frameResult: ManifoldInstance;
+  frameShell: ManifoldInstance;
+  offsetMidFrame: CrossSectionInstance;
+  midFrameSection: CrossSectionInstance;
 };
 
 type FrameState = {
@@ -64,6 +66,7 @@ export function buildPhoneFramePreview({
       scope: geometryScope,
       sourceBody: new runtime.Manifold(manifoldMesh),
       thickness: config.frame.thickness,
+      midFrameGap: config.frame.midFrame.gap,
       booleanHeight,
       booleanOvershoot,
       boundingBox
@@ -75,13 +78,16 @@ export function buildPhoneFramePreview({
     }
 
     const baseFrameSection = frameDag.get("frameSection");
-
     if (baseFrameSection.isEmpty()) {
       throw new Error("Inner outline removed the entire frame.");
     }
 
-    const baseFrameResult = frameDag.get("frameResult");
+    const midFrameSection = frameDag.get("midFrameSection");
+    if (midFrameSection.isEmpty()) {
+      throw new Error("midFrame.gap is too large for this phone outline.");
+    }
 
+    const baseFrameResult = frameDag.get("frameShell");
     if (baseFrameResult.isEmpty()) {
       throw new Error("Frame boolean result is empty.");
     }
@@ -111,10 +117,22 @@ export function buildPhoneFramePreview({
         size,
         inner,
         frameRingSection,
+        midFrameSection,
         state: frameState,
         warnings
       });
     }
+
+    frameState = applyMidFrame({
+      config,
+      runtime,
+      scope: geometryScope,
+      size,
+      booleanOvershoot,
+      midFrameSection,
+      state: frameState,
+      warnings
+    });
 
     const frameGeometry = manifoldToBufferGeometry(frameState.frameResult);
     frameGeometry.computeBoundingBox();
@@ -145,6 +163,7 @@ function createPhoneFrameDag({
   scope,
   sourceBody,
   thickness,
+  midFrameGap,
   booleanHeight,
   booleanOvershoot,
   boundingBox
@@ -152,6 +171,7 @@ function createPhoneFrameDag({
   scope: GeometryScope;
   sourceBody: ManifoldInstance;
   thickness: number;
+  midFrameGap: number;
   booleanHeight: number;
   booleanOvershoot: number;
   boundingBox: THREE.Box3;
@@ -176,8 +196,14 @@ function createPhoneFrameDag({
     .node("innerBottom", ["innerVolume"], ({ innerVolume }) =>
       innerVolume.translate(0, 0, boundingBox.min.z - booleanOvershoot)
     )
-    .node("frameResult", ["sourceBody", "innerBottom"], ({ sourceBody, innerBottom }) =>
+    .node("frameShell", ["sourceBody", "innerBottom"], ({ sourceBody, innerBottom }) =>
       sourceBody.subtract(innerBottom)
+    )
+    .node("offsetMidFrame", ["inner"], ({ inner }) =>
+      inner.offset(-midFrameGap)
+    )
+    .node("midFrameSection", ["offsetMidFrame"], ({ offsetMidFrame }) =>
+      offsetMidFrame.simplify(Math.max(midFrameGap / 18, 1e-4))
     );
 }
 
@@ -250,6 +276,122 @@ function applySeamCuts({
   };
 }
 
+function applyMidFrame({
+  config,
+  runtime,
+  scope,
+  size,
+  booleanOvershoot,
+  midFrameSection,
+  state,
+  warnings
+}: {
+  config: BuildPreviewOptions["config"];
+  runtime: BuildPreviewOptions["runtime"];
+  scope: GeometryScope;
+  size: THREE.Vector3;
+  booleanOvershoot: number;
+  midFrameSection: CrossSectionInstance;
+  state: FrameState;
+  warnings: string[];
+}): FrameState {
+  const midFrameScope = new GeometryScope();
+  let currentMidFrameResult = midFrameScope.create(() =>
+    midFrameSection.extrude(size.z, 0, 0, [1, 1], true)
+  );
+
+  try {
+    if (config.frame.midFrame.pockets.length === 0) {
+      warnings.push("No mid-frame CNC pockets configured");
+    }
+
+    for (const [index, pocket] of config.frame.midFrame.pockets.entries()) {
+      const iterationScope = new GeometryScope();
+
+      try {
+        const insetSection =
+          pocket.inset === 0
+            ? midFrameSection
+            : iterationScope.create(() => midFrameSection.offset(-pocket.inset));
+
+        if (insetSection.isEmpty()) {
+          warnings.push(
+            `Ignored mid-frame pocket ${index + 1} (${pocket.label}): inset collapsed the section.`
+          );
+          continue;
+        }
+
+        const pocketBand = iterationScope.create(() =>
+          createMidFramePocketBand(runtime, pocket.offset, pocket.height, size.x * 2)
+        );
+        const pocketSection = iterationScope.create(() =>
+          insetSection.intersect(pocketBand)
+        );
+
+        if (pocketSection.isEmpty()) {
+          warnings.push(
+            `Ignored mid-frame pocket ${index + 1} (${pocket.label}): outside the mid-frame footprint.`
+          );
+          continue;
+        }
+
+        const pocketDepth = clampPocketDepth(pocket.depth, size.z);
+        if (pocketDepth !== pocket.depth) {
+          warnings.push(
+            `Clamped mid-frame pocket ${index + 1} (${pocket.label}) depth from ${formatScalar(pocket.depth)} to ${formatScalar(pocketDepth)}.`
+          );
+        }
+
+        const pocketVolume = iterationScope.create(() =>
+          createScreenSidePocketVolume(
+            pocketSection,
+            pocketDepth,
+            size.z,
+            booleanOvershoot
+          )
+        );
+        const nextMidFrameResult = iterationScope.create(() =>
+          currentMidFrameResult.subtract(pocketVolume)
+        );
+
+        if (nextMidFrameResult.isEmpty()) {
+          throw new Error("Mid-frame was fully removed by CNC pockets.");
+        }
+
+        currentMidFrameResult = midFrameScope.replace(
+          currentMidFrameResult,
+          midFrameScope.adopt(iterationScope, nextMidFrameResult)
+        );
+      } finally {
+        iterationScope.disposeAll();
+      }
+    }
+
+    const nextFrameResult = midFrameScope.create(() =>
+      runtime.Manifold.union([state.frameResult, currentMidFrameResult])
+    );
+    const nextFootprintSection = midFrameScope.create(() =>
+      state.frameSection.add(midFrameSection)
+    );
+    const simplifiedFootprintSection = midFrameScope.create(() =>
+      nextFootprintSection.simplify(1e-4)
+    );
+
+    return {
+      frameSection: scope.replace(
+        state.frameSection,
+        scope.adopt(midFrameScope, simplifiedFootprintSection)
+      ),
+      frameResult: scope.replace(
+        state.frameResult,
+        scope.adopt(midFrameScope, nextFrameResult)
+      )
+    };
+  } finally {
+    midFrameScope.disposeAll();
+  }
+}
+
 function applyRibs({
   config,
   runtime,
@@ -257,6 +399,7 @@ function applyRibs({
   size,
   inner,
   frameRingSection,
+  midFrameSection,
   state,
   warnings
 }: {
@@ -266,14 +409,16 @@ function applyRibs({
   size: THREE.Vector3;
   inner: CrossSectionInstance;
   frameRingSection: CrossSectionInstance;
+  midFrameSection: CrossSectionInstance;
   state: FrameState;
   warnings: string[];
 }): FrameState {
-  const ribDepth = getRibDepth(size, config.frame.thickness);
   const ribJoinOverlap = getRibJoinOverlap(config.frame.thickness);
   const ribSimplifyEpsilon = 1e-4;
   const innerBounds = inner.bounds();
+  const midFrameBounds = midFrameSection.bounds();
   const ribScope = new GeometryScope();
+  const initialFootprintSection = state.frameSection;
   let currentFootprintSection = state.frameSection;
   let currentFrameResult = state.frameResult;
 
@@ -291,7 +436,7 @@ function applyRibs({
             rib.distance,
             rib.width,
             innerBounds,
-            ribDepth,
+            midFrameBounds,
             ribJoinOverlap
           )
         );
@@ -311,11 +456,19 @@ function applyRibs({
           )
         );
 
-        const ribAnchor = iterationScope.create(() =>
+        const frameAnchor = iterationScope.create(() =>
           ribSection.intersect(frameRingSection)
         );
-        if (ribAnchor.isEmpty()) {
+        if (frameAnchor.isEmpty()) {
           warnings.push(`Ignored rib ${index + 1}: does not touch the remaining frame.`);
+          continue;
+        }
+
+        const midFrameAnchor = iterationScope.create(() =>
+          ribSection.intersect(midFrameSection)
+        );
+        if (midFrameAnchor.isEmpty()) {
+          warnings.push(`Ignored rib ${index + 1}: does not reach the mid-frame.`);
           continue;
         }
 
@@ -360,7 +513,7 @@ function applyRibs({
           simplifiedFootprintSection
         );
         if (
-          currentFootprintSection !== frameRingSection &&
+          currentFootprintSection !== initialFootprintSection &&
           currentFootprintSection !== retainedFootprintSection
         ) {
           scope.dispose(currentFootprintSection);
@@ -384,10 +537,6 @@ function getSeamCutDepth(size: THREE.Vector3, thickness: number) {
   return Math.max(thickness * 1.35, Math.min(size.x, size.y) * 0.03);
 }
 
-function getRibDepth(size: THREE.Vector3, thickness: number) {
-  return Math.max(thickness * 2.25, Math.min(size.x, size.y) * 0.08, 1);
-}
-
 function normalizeRibHeight(thickness: number, sourceThickness: number) {
   return Math.min(thickness, sourceThickness);
 }
@@ -395,6 +544,10 @@ function normalizeRibHeight(thickness: number, sourceThickness: number) {
 function clampRibOffset(offset: number, ribHeight: number, sourceThickness: number) {
   const maxOffset = Math.max((sourceThickness - ribHeight) / 2, 0);
   return THREE.MathUtils.clamp(offset, -maxOffset, maxOffset);
+}
+
+function clampPocketDepth(depth: number, sourceThickness: number) {
+  return THREE.MathUtils.clamp(depth, 0, sourceThickness);
 }
 
 function getRibJoinOverlap(thickness: number) {
@@ -437,40 +590,66 @@ function createSeamCutter(
   );
 }
 
+function createMidFramePocketBand(
+  runtime: BuildPreviewOptions["runtime"],
+  offset: number,
+  height: number,
+  width: number
+) {
+  return runtime.CrossSection.square([width, height], true).translate(0, offset);
+}
+
+function createScreenSidePocketVolume(
+  pocketSection: CrossSectionInstance,
+  depth: number,
+  sourceThickness: number,
+  overshoot: number
+) {
+  const cutHeight = depth + overshoot;
+  return pocketSection
+    .extrude(cutHeight, 0, 0, [1, 1], true)
+    .translate(0, 0, sourceThickness / 2 - depth / 2 + overshoot / 2);
+}
+
 function createRibSection(
   runtime: BuildPreviewOptions["runtime"],
   position: BuildPreviewOptions["config"]["frame"]["ribs"][number]["position"],
   distance: number,
   width: number,
-  bounds: {
+  innerBounds: {
     min: [number, number];
     max: [number, number];
   },
-  depth: number,
+  midFrameBounds: {
+    min: [number, number];
+    max: [number, number];
+  },
   joinOverlap: number
 ) {
-  const span = depth + joinOverlap;
-
   if (position === "top") {
+    const span = innerBounds.max[1] - midFrameBounds.max[1] + joinOverlap * 2;
     return runtime.CrossSection.square([width, span], true).translate(
       distance,
-      bounds.max[1] + (joinOverlap - depth) / 2
+      (innerBounds.max[1] + midFrameBounds.max[1]) / 2
     );
   }
   if (position === "bottom") {
+    const span = midFrameBounds.min[1] - innerBounds.min[1] + joinOverlap * 2;
     return runtime.CrossSection.square([width, span], true).translate(
       distance,
-      bounds.min[1] + (depth - joinOverlap) / 2
+      (innerBounds.min[1] + midFrameBounds.min[1]) / 2
     );
   }
   if (position === "left") {
+    const span = midFrameBounds.min[0] - innerBounds.min[0] + joinOverlap * 2;
     return runtime.CrossSection.square([span, width], true).translate(
-      bounds.min[0] + (depth - joinOverlap) / 2,
+      (innerBounds.min[0] + midFrameBounds.min[0]) / 2,
       distance
     );
   }
+  const span = innerBounds.max[0] - midFrameBounds.max[0] + joinOverlap * 2;
   return runtime.CrossSection.square([span, width], true).translate(
-    bounds.max[0] + (joinOverlap - depth) / 2,
+    (innerBounds.max[0] + midFrameBounds.max[0]) / 2,
     distance
   );
 }

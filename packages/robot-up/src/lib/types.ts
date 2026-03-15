@@ -1,4 +1,4 @@
-export type RuntimeKind = "mujoco" | "isaacsim";
+export type RuntimeKind = "mujoco" | "isaacsim" | "renderer";
 
 export type AssetEntryKind =
   | "mujoco-xml"
@@ -45,7 +45,7 @@ export type SupportedMjcfGeomType =
   | "ellipsoid"
   | "plane";
 
-export type RenderableMeshFormat = "obj" | "stl";
+export type RenderableMeshFormat = "obj" | "stl" | "ply";
 
 export type ParsedMjcfMeshAsset = {
   name: string;

@@ -9,7 +9,15 @@ export const DEFAULT_PHONE_CONFIG: PhoneConfig = {
       { position: "left", width: 2, distance: 30 },
       { position: "right", width: 2, distance: -22 }
     ],
-    ribs: [{ position: "left", width: 2.2, distance: 0, thickness: 6.4, offset: 0 }]
+    ribs: [{ position: "left", width: 2.2, distance: 0, thickness: 6.4, offset: 0 }],
+    midFrame: {
+      gap: 4,
+      pockets: [
+        { label: "pcb", offset: 46, height: 26, inset: 5.2, depth: 6.1 },
+        { label: "battery", offset: 0, height: 62, inset: 3.2, depth: 6.8 },
+        { label: "sub-pcb", offset: -46, height: 24, inset: 5.4, depth: 6.1 }
+      ]
+    }
   }
 };
 

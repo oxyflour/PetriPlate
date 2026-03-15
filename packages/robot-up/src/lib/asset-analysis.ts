@@ -8,10 +8,12 @@ import {
   SAMPLE_FRANKA_STAGE_USDA,
   SAMPLE_ISAAC_ASSET_NAME,
   SAMPLE_MESH_PATH,
+  SAMPLE_3DGS_PLY,
   SAMPLE_SCENE_MJCF,
   SAMPLE_SCENE_PATH,
   SAMPLE_MJCF,
   SAMPLE_OBJ,
+  SAMPLE_SPLAT_PATH,
   SAMPLE_STAGE_PATH,
   SAMPLE_STAGE_USDA
 } from "./sample-asset";
@@ -19,7 +21,9 @@ import type {
   AssetAnalysis,
   AssetEntryKind,
   AssetFileEntry,
+  ColorRgba,
   ParsedMjcfScene,
+  RenderableMeshFormat,
   RuntimeKind
 } from "./types";
 
@@ -32,14 +36,28 @@ const RELEVANT_EXTENSIONS = new Set([
   "urdf",
   "obj",
   "stl",
+  "ply",
   "msh"
 ]);
 const ISAAC_STAGE_EXTENSIONS = new Set(["usda", "usd", "usdc"]);
 const ISAAC_URDF_EXTENSIONS = new Set(["urdf"]);
-const MESH_EXTENSIONS = new Set(["obj", "stl", "msh"]);
+const MESH_EXTENSIONS = new Set(["obj", "stl", "ply", "msh"]);
+const DEFAULT_RENDERER_MESH_COLOR: ColorRgba = {
+  r: 0.81,
+  g: 0.85,
+  b: 0.9,
+  a: 1
+};
+const DEFAULT_RENDERER_ENV_COLOR: ColorRgba = {
+  r: 1,
+  g: 1,
+  b: 1,
+  a: 1
+};
 
 export async function createSampleAssetAnalysis(): Promise<AssetAnalysis> {
   const sampleMeshBlob = new Blob([SAMPLE_OBJ], { type: "text/plain" });
+  const sampleSplatBlob = new Blob([SAMPLE_3DGS_PLY], { type: "text/plain" });
 
   return buildAnalysis({
     sourceName: SAMPLE_ASSET_NAME,
@@ -66,6 +84,14 @@ export async function createSampleAssetAnalysis(): Promise<AssetAnalysis> {
         kind: "mesh",
         blob: sampleMeshBlob,
         objectUrl: createObjectUrl(sampleMeshBlob)
+      },
+      {
+        path: SAMPLE_SPLAT_PATH,
+        size: new TextEncoder().encode(SAMPLE_3DGS_PLY).byteLength,
+        extension: "ply",
+        kind: "mesh",
+        blob: sampleSplatBlob,
+        objectUrl: createObjectUrl(sampleSplatBlob)
       }
     ]
   });
@@ -108,6 +134,7 @@ export async function createSampleAssetFile(): Promise<File> {
   archive.file(SAMPLE_SCENE_PATH, SAMPLE_SCENE_MJCF);
   archive.file(SAMPLE_ARM_PATH, SAMPLE_MJCF);
   archive.file(SAMPLE_MESH_PATH, SAMPLE_OBJ);
+  archive.file(SAMPLE_SPLAT_PATH, SAMPLE_3DGS_PLY);
 
   const blob = await archive.generateAsync({ type: "blob" });
   return new File([blob], "sample-mujoco-bundle.zip", {
@@ -278,6 +305,46 @@ export function resolveIsaacEntrySelection(
   };
 }
 
+export function resolveRendererEntrySelection(
+  entries: AssetFileEntry[],
+  selectedEntryPath: string | null | undefined
+): {
+  entry: AssetFileEntry | null;
+  scene: ParsedMjcfScene | null;
+  warnings: string[];
+} {
+  const meshCandidates = entries.filter(isRenderableMeshEntry);
+  const fallbackEntry = meshCandidates[0] || null;
+  const selectedEntry =
+    (selectedEntryPath
+      ? meshCandidates.find((entry) => entry.path === selectedEntryPath) || null
+      : null) || fallbackEntry;
+
+  if (!selectedEntry?.objectUrl) {
+    return {
+      entry: selectedEntry,
+      scene: null,
+      warnings: []
+    };
+  }
+
+  const companionPlyEntries =
+    selectedEntry.extension === "ply"
+      ? []
+      : meshCandidates.filter(
+          (entry) =>
+            entry.path !== selectedEntry.path &&
+            entry.extension === "ply" &&
+            Boolean(entry.objectUrl)
+        );
+
+  return {
+    entry: selectedEntry,
+    scene: createRendererScene(selectedEntry, companionPlyEntries),
+    warnings: collectRendererWarnings(meshCandidates, companionPlyEntries)
+  };
+}
+
 async function readRelevantZipEntries(buffer: ArrayBuffer): Promise<AssetFileEntry[]> {
   const zip = await JSZip.loadAsync(buffer);
   const entries: AssetFileEntry[] = [];
@@ -355,8 +422,10 @@ function buildAnalysis(input: {
   const warnings: string[] = [];
   const mujocoCandidates = input.entries.filter((entry) => entry.kind === "mujoco-xml");
   const isaacCandidates = [...input.entries.filter(isIsaacEntry)].sort(compareIsaacEntries);
+  const rendererCandidates = input.entries.filter(isRenderableMeshEntry);
   const mujocoEntry = mujocoCandidates[0] || null;
   const isaacEntry = isaacCandidates[0] || null;
+  const rendererEntry = rendererCandidates[0] || null;
 
   if (mujocoEntry) {
     runtimeEntries.mujoco = mujocoEntry;
@@ -366,6 +435,10 @@ function buildAnalysis(input: {
     runtimeEntries.isaacsim = isaacEntry;
     runtimeCandidates.isaacsim = isaacCandidates;
   }
+  if (rendererEntry) {
+    runtimeEntries.renderer = rendererEntry;
+    runtimeCandidates.renderer = rendererCandidates;
+  }
 
   const availableRuntimes: RuntimeKind[] = [];
   if (mujocoEntry) {
@@ -374,8 +447,17 @@ function buildAnalysis(input: {
   if (isaacEntry) {
     availableRuntimes.push("isaacsim");
   }
+  if (rendererEntry) {
+    availableRuntimes.push("renderer");
+  }
 
-  const defaultRuntime = mujocoEntry ? "mujoco" : isaacEntry ? "isaacsim" : null;
+  const defaultRuntime = mujocoEntry
+    ? "mujoco"
+    : isaacEntry
+      ? "isaacsim"
+      : rendererEntry
+        ? "renderer"
+        : null;
   if (mujocoEntry && isaacEntry) {
     warnings.push(
       "Archive contains both MJCF and USD assets, so MuJoCo is selected by default."
@@ -391,8 +473,15 @@ function buildAnalysis(input: {
       `Detected ${isaacCandidates.length} Isaac USD/URDF candidates. Pick the desired asset below.`
     );
   }
+  if (rendererCandidates.length > 1) {
+    warnings.push(
+      `Detected ${rendererCandidates.length} renderable mesh assets. Pick the desired preview file below.`
+    );
+  }
   if (!defaultRuntime) {
-    warnings.push("No MuJoCo XML, Isaac USD stage, or URDF asset was found in the selected asset.");
+    warnings.push(
+      "No MuJoCo XML, Isaac USD stage, URDF asset, or renderable mesh was found in the selected asset."
+    );
   }
 
   const defaultMujocoSelection = resolveMujocoEntrySelection(input.entries, mujocoEntry?.path || null);
@@ -446,6 +535,10 @@ function createTextPreview(source: string): string {
 
 function isIsaacEntry(entry: AssetFileEntry) {
   return entry.kind === "isaac-stage" || entry.kind === "isaac-urdf";
+}
+
+function isRenderableMeshEntry(entry: AssetFileEntry) {
+  return entry.kind === "mesh" && Boolean(entry.objectUrl) && Boolean(toRenderableMeshFormat(entry.extension));
 }
 
 function compareIsaacEntries(left: AssetFileEntry, right: AssetFileEntry) {
@@ -502,10 +595,88 @@ function createObjectUrl(blob: Blob): string {
   return URL.createObjectURL(blob);
 }
 
+function createRendererScene(
+  selectedEntry: AssetFileEntry,
+  companionPlyEntries: AssetFileEntry[]
+): ParsedMjcfScene | null {
+  const selectedFormat = toRenderableMeshFormat(selectedEntry.extension);
+  if (!selectedEntry.objectUrl || !selectedFormat) {
+    return null;
+  }
+
+  const meshEntries = [
+    { entry: selectedEntry, color: DEFAULT_RENDERER_MESH_COLOR },
+    ...companionPlyEntries
+      .map((entry) => {
+        const format = toRenderableMeshFormat(entry.extension);
+        if (!entry.objectUrl || !format) {
+          return null;
+        }
+        return { entry, color: DEFAULT_RENDERER_ENV_COLOR };
+      })
+      .filter((entry): entry is { entry: AssetFileEntry; color: ColorRgba } => Boolean(entry))
+  ];
+
+  return {
+    modelName: selectedEntry.path,
+    compilerAngle: "degree",
+    bodyCount: 0,
+    geomCount: meshEntries.length,
+    renderedGeomCount: meshEntries.length,
+    meshGeomCount: meshEntries.length,
+    resolvedMeshGeomCount: meshEntries.length,
+    hiddenGeomCount: 0,
+    unsupportedGeoms: [],
+    geoms: meshEntries.map(({ entry, color }, index) => ({
+      id: `renderer-geom-${index + 1}`,
+      name: entry.path.split("/").pop() || `mesh_${index + 1}`,
+      type: "mesh",
+      position: { x: 0, y: 0, z: 0 },
+      quaternion: { x: 0, y: 0, z: 0, w: 1 },
+      size: { x: 1, y: 1, z: 1 },
+      color,
+      group: null,
+      materialName: null,
+      mesh: {
+        name: entry.path.split("/").pop() || `mesh_${index + 1}`,
+        path: entry.path,
+        format: toRenderableMeshFormat(entry.extension) || selectedFormat,
+        objectUrl: entry.objectUrl || null,
+        scale: { x: 1, y: 1, z: 1 }
+      }
+    }))
+  };
+}
+
+function collectRendererWarnings(
+  meshCandidates: AssetFileEntry[],
+  companionPlyEntries: AssetFileEntry[]
+) {
+  const warnings: string[] = [];
+  if (meshCandidates.length > 1) {
+    warnings.push(
+      `Renderer mode found ${meshCandidates.length} mesh asset(s). Switch the preview target below when needed.`
+    );
+  }
+  if (companionPlyEntries.length > 0) {
+    warnings.push(
+      `Renderer mode is using ${companionPlyEntries.length} companion PLY asset(s) as environment lighting sources when they decode as 3D Gaussian splats.`
+    );
+  }
+  return warnings;
+}
+
 function getExtension(path: string): string {
   const normalized = path.toLowerCase();
   const dotIndex = normalized.lastIndexOf(".");
   return dotIndex >= 0 ? normalized.slice(dotIndex + 1) : "";
+}
+
+function toRenderableMeshFormat(extension: string): RenderableMeshFormat | null {
+  if (extension === "obj" || extension === "stl" || extension === "ply") {
+    return extension;
+  }
+  return null;
 }
 
 function normalizePath(path: string): string {

@@ -702,7 +702,7 @@ function getExtension(path: string): string {
 }
 
 function toRenderableMeshFormat(extension: string): RenderableMeshFormat | null {
-  if (extension === "obj" || extension === "stl") {
+  if (extension === "obj" || extension === "stl" || extension === "ply") {
     return extension;
   }
   return null;

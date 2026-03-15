@@ -2,6 +2,7 @@ export const SAMPLE_ASSET_NAME = "sample://multi-xml-bundle";
 export const SAMPLE_SCENE_PATH = "sample/scene.xml";
 export const SAMPLE_ARM_PATH = "sample/industrial-arm.xml";
 export const SAMPLE_MESH_PATH = "sample/assets/base_shell.obj";
+export const SAMPLE_SPLAT_PATH = "sample/assets/factory_lighting.ply";
 export const SAMPLE_ISAAC_ASSET_NAME = "sample://factory-stage";
 export const SAMPLE_STAGE_PATH = "sample-factory-cell.usda";
 export const SAMPLE_FRANKA_ASSET_NAME = "sample://official-franka";
@@ -74,6 +75,34 @@ f 3 7 8
 f 3 8 4
 f 4 8 5
 f 4 5 1
+`;
+
+export const SAMPLE_3DGS_PLY = `ply
+format ascii 1.0
+element vertex 8
+property float x
+property float y
+property float z
+property float f_dc_0
+property float f_dc_1
+property float f_dc_2
+property float opacity
+property float scale_0
+property float scale_1
+property float scale_2
+property float rot_0
+property float rot_1
+property float rot_2
+property float rot_3
+end_header
+-1.40 -1.20 1.60 1.595 0.354 -0.354 3.5 -2.4 -2.4 -2.6 1 0 0 0
+1.30 -1.10 1.75 -0.177 0.886 1.418 3.2 -2.5 -2.5 -2.7 1 0 0 0
+-1.55 1.30 1.40 0.709 0.532 -0.177 3.1 -2.6 -2.4 -2.8 1 0 0 0
+1.55 1.10 1.55 1.241 0.709 -0.532 3.4 -2.5 -2.5 -2.7 1 0 0 0
+0.00 -1.75 1.25 1.418 1.063 0.177 2.9 -2.7 -2.7 -2.9 1 0 0 0
+-0.10 1.65 1.20 -0.354 0.709 1.241 3.0 -2.7 -2.6 -2.9 1 0 0 0
+-1.80 0.00 1.50 0.354 0.177 0.886 2.8 -2.6 -2.6 -2.8 1 0 0 0
+1.80 0.00 1.45 1.063 0.354 0.000 2.8 -2.6 -2.6 -2.8 1 0 0 0
 `;
 
 export const SAMPLE_STAGE_USDA = `#usda 1.0

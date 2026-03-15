@@ -3,8 +3,12 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
-import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+import {
+  GAUSSIAN_SPLAT_LAYER,
+  instantiateRenderableMesh,
+  isGaussianSplatObject,
+  loadRenderableMeshTemplate
+} from "../lib/renderable-mesh";
 import type {
   ColorRgba,
   MujocoManifestGeom,
@@ -12,7 +16,6 @@ import type {
   MujocoPoseFrameMessage,
   MujocoPoseMessage,
   ParsedMjcfGeom,
-  ParsedMjcfMeshAsset,
   ParsedMjcfScene,
   Quat,
   SupportedMjcfGeomType,
@@ -26,10 +29,6 @@ type MujocoPreviewProps = {
   frame?: MujocoPoseFrameMessage | null;
 };
 
-const objLoader = new OBJLoader();
-const stlLoader = new STLLoader();
-const meshAssetCache = new Map<string, Promise<THREE.Object3D | null>>();
-
 export default function MujocoPreview({
   scene,
   manifest = null,
@@ -39,6 +38,10 @@ export default function MujocoPreview({
   const mountRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const pmremGeneratorRef = useRef<THREE.PMREMGenerator | null>(null);
+  const environmentTargetRef = useRef<THREE.WebGLRenderTarget | null>(null);
   const runtimeRootRef = useRef<THREE.Group | null>(null);
   const modelRootRef = useRef<THREE.Group | null>(null);
   const bodyNodesRef = useRef<Map<number, THREE.Group>>(new Map());
@@ -52,6 +55,7 @@ export default function MujocoPreview({
     const scene3d = new THREE.Scene();
     scene3d.background = new THREE.Color("#0b1015");
     scene3d.fog = new THREE.Fog("#0b1015", 8, 18);
+    sceneRef.current = scene3d;
 
     const camera = new THREE.PerspectiveCamera(
       48,
@@ -61,12 +65,17 @@ export default function MujocoPreview({
     );
     camera.position.set(2.8, 1.9, 1.55);
     camera.lookAt(0, 0, 0.35);
+    camera.layers.enable(GAUSSIAN_SPLAT_LAYER);
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
+    rendererRef.current = renderer;
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    pmremGenerator.compileCubemapShader();
+    pmremGeneratorRef.current = pmremGenerator;
     mount.appendChild(renderer.domElement);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -121,12 +130,17 @@ export default function MujocoPreview({
       controls.dispose();
       controlsRef.current = null;
       bodyNodesRef.current = new Map();
+      clearEnvironmentMap();
       clearGroup(runtimeRoot);
       runtimeRootRef.current = null;
       modelRootRef.current = null;
+      sceneRef.current = null;
       cameraRef.current = null;
       mount.removeChild(renderer.domElement);
+      pmremGenerator.dispose();
+      pmremGeneratorRef.current = null;
       renderer.dispose();
+      rendererRef.current = null;
     };
   }, []);
 
@@ -172,6 +186,7 @@ export default function MujocoPreview({
     runtimeRoot.quaternion.identity();
 
     const buildModel = async () => {
+      clearEnvironmentMap();
       clearGroup(modelRoot);
 
       if (manifest?.geoms.length) {
@@ -183,10 +198,12 @@ export default function MujocoPreview({
         if (topLevelNodes.length === 0) {
           modelRoot.add(createFallbackModel());
           fitCamera(cameraRef.current, controlsRef.current, [modelRoot]);
+          applyGaussianEnvironmentMap([modelRoot]);
           return;
         }
         topLevelNodes.forEach((node) => modelRoot.add(node));
         fitCamera(cameraRef.current, controlsRef.current, [modelRoot]);
+        applyGaussianEnvironmentMap([modelRoot]);
         return;
       }
 
@@ -207,6 +224,7 @@ export default function MujocoPreview({
         if (builtNodes.length === 0) {
           modelRoot.add(createFallbackModel());
           fitCamera(cameraRef.current, controlsRef.current, [modelRoot]);
+          applyGaussianEnvironmentMap([modelRoot]);
           return;
         }
 
@@ -219,11 +237,15 @@ export default function MujocoPreview({
           controlsRef.current,
           preferredFitNodes.length > 0 ? preferredFitNodes : [...modelRoot.children]
         );
+        applyGaussianEnvironmentMap(
+          preferredFitNodes.length > 0 ? preferredFitNodes : [...modelRoot.children]
+        );
         return;
       }
 
       modelRoot.add(createFallbackModel());
       fitCamera(cameraRef.current, controlsRef.current, [modelRoot]);
+      applyGaussianEnvironmentMap([modelRoot]);
     };
 
     buildModel().catch((error) => {
@@ -234,11 +256,13 @@ export default function MujocoPreview({
       clearGroup(modelRoot);
       modelRoot.add(createFallbackModel());
       fitCamera(cameraRef.current, controlsRef.current, [modelRoot]);
+      applyGaussianEnvironmentMap([modelRoot]);
     });
 
     return () => {
       cancelled = true;
       bodyNodesRef.current = new Map();
+      clearEnvironmentMap();
       clearGroup(modelRoot);
     };
   }, [scene, manifest]);
@@ -284,6 +308,62 @@ export default function MujocoPreview({
 
     bodyNodesRef.current = bodyNodes;
     return topLevelNodes;
+  }
+
+  function clearEnvironmentMap() {
+    const previewScene = sceneRef.current;
+    if (previewScene) {
+      previewScene.environment = null;
+    }
+    if (environmentTargetRef.current) {
+      environmentTargetRef.current.dispose();
+      environmentTargetRef.current = null;
+    }
+    markEnvironmentConsumers(modelRootRef.current);
+  }
+
+  function applyGaussianEnvironmentMap(fitTargets: THREE.Object3D[]) {
+    const previewScene = sceneRef.current;
+    const renderer = rendererRef.current;
+    const pmremGenerator = pmremGeneratorRef.current;
+    const modelRoot = modelRootRef.current;
+    if (!previewScene || !renderer || !pmremGenerator || !modelRoot) {
+      return;
+    }
+
+    clearEnvironmentMap();
+
+    const gaussianNodes = collectGaussianNodes(modelRoot);
+    if (gaussianNodes.length === 0) {
+      return;
+    }
+
+    modelRoot.updateMatrixWorld(true);
+    previewScene.updateMatrixWorld(true);
+
+    const cubeRenderTarget = new THREE.WebGLCubeRenderTarget(256);
+    const cubeCamera = new THREE.CubeCamera(0.01, 80, cubeRenderTarget);
+    cubeCamera.layers.disableAll();
+    cubeCamera.layers.enable(GAUSSIAN_SPLAT_LAYER);
+    cubeCamera.position.copy(resolveEnvironmentCapturePoint(gaussianNodes, fitTargets));
+
+    const previousBackground = previewScene.background;
+    const previousFog = previewScene.fog;
+    previewScene.background = null;
+    previewScene.fog = null;
+    previewScene.add(cubeCamera);
+
+    cubeCamera.update(renderer, previewScene);
+
+    previewScene.remove(cubeCamera);
+    previewScene.background = previousBackground;
+    previewScene.fog = previousFog;
+
+    const nextEnvironmentTarget = pmremGenerator.fromCubemap(cubeRenderTarget.texture);
+    cubeRenderTarget.dispose();
+    environmentTargetRef.current = nextEnvironmentTarget;
+    previewScene.environment = nextEnvironmentTarget.texture;
+    markEnvironmentConsumers(modelRoot);
   }
 }
 
@@ -388,6 +468,7 @@ function createPrimitiveNode(
   mesh.name = name;
   mesh.castShadow = type !== "plane";
   mesh.receiveShadow = true;
+  mesh.userData.renderableKind = type === "plane" ? "primitive-plane" : "primitive";
   return mesh;
 }
 
@@ -397,12 +478,12 @@ async function createSceneMeshNode(geom: ParsedMjcfGeom): Promise<THREE.Object3D
     return null;
   }
 
-  const template = await loadMeshTemplate(meshAsset.format, meshAsset.objectUrl);
+  const template = await loadRenderableMeshTemplate(meshAsset.format, meshAsset.objectUrl);
   if (!template) {
     return null;
   }
 
-  const clone = cloneMeshTemplate(template, geom.color);
+  const clone = instantiateRenderableMesh(template, geom.color);
   clone.scale.set(
     normalizeScaleComponent(meshAsset.scale.x),
     normalizeScaleComponent(meshAsset.scale.y),
@@ -420,12 +501,12 @@ async function createRuntimeMeshNode(geom: MujocoManifestGeom): Promise<THREE.Ob
     return null;
   }
 
-  const template = await loadMeshTemplate(geom.mesh.format, geom.mesh.url);
+  const template = await loadRenderableMeshTemplate(geom.mesh.format, geom.mesh.url);
   if (!template) {
     return null;
   }
 
-  const clone = cloneMeshTemplate(template, geom.rgba);
+  const clone = instantiateRenderableMesh(template, geom.rgba);
   const geomPosition = readVec3(geom.position, 0);
   const geomQuaternion = readQuat(geom.quaternion);
   const meshPosition = readVec3(geom.mesh.position, 0);
@@ -459,55 +540,6 @@ async function createRuntimeMeshNode(geom: MujocoManifestGeom): Promise<THREE.Ob
   root.applyMatrix4(correctionMatrix);
   root.updateMatrixWorld(true);
   return root;
-}
-
-async function loadMeshTemplate(format: string, url: string): Promise<THREE.Object3D | null> {
-  const normalizedFormat = format.toLowerCase();
-  const cacheKey = `${normalizedFormat}:${url}`;
-
-  if (!meshAssetCache.has(cacheKey)) {
-    let promise: Promise<THREE.Object3D | null>;
-    if (normalizedFormat === "obj") {
-      promise = objLoader.loadAsync(url);
-    } else if (normalizedFormat === "stl") {
-      promise = stlLoader.loadAsync(url).then((geometry) => {
-        geometry.computeVertexNormals();
-        return new THREE.Mesh(geometry);
-      });
-    } else {
-      promise = Promise.resolve(null);
-    }
-    meshAssetCache.set(cacheKey, promise);
-  }
-
-  return meshAssetCache.get(cacheKey) || null;
-}
-
-function cloneMeshTemplate(template: THREE.Object3D, color: ColorRgba) {
-  const clone = template.clone(true);
-
-  clone.traverse((node: THREE.Object3D) => {
-    const meshNode = node as THREE.Mesh;
-    if (!meshNode.isMesh) {
-      return;
-    }
-    if (meshNode.geometry) {
-      meshNode.geometry = meshNode.geometry.clone();
-    }
-    if (meshNode.material) {
-      if (Array.isArray(meshNode.material)) {
-        meshNode.material.forEach((candidate: THREE.Material) => candidate.dispose());
-      } else {
-        meshNode.material.dispose();
-      }
-    }
-    meshNode.material = createStandardMaterial(color, "mesh");
-    meshNode.castShadow = true;
-    meshNode.receiveShadow = true;
-    meshNode.frustumCulled = false;
-  });
-
-  return clone;
 }
 
 function createStandardMaterial(
@@ -633,6 +665,64 @@ function fitCamera(
     camera.lookAt(center);
   }
   camera.updateProjectionMatrix();
+}
+
+function collectGaussianNodes(root: THREE.Object3D) {
+  const gaussianNodes: THREE.Object3D[] = [];
+  root.traverse((node: THREE.Object3D) => {
+    if (isGaussianSplatObject(node)) {
+      gaussianNodes.push(node);
+    }
+  });
+  return gaussianNodes;
+}
+
+function resolveEnvironmentCapturePoint(
+  gaussianNodes: THREE.Object3D[],
+  fitTargets: THREE.Object3D[]
+) {
+  const box = new THREE.Box3();
+  const targets = fitTargets.length > 0 ? fitTargets : gaussianNodes;
+  for (const target of targets) {
+    box.expandByObject(target);
+  }
+  if (box.isEmpty()) {
+    return new THREE.Vector3();
+  }
+  return box.getCenter(new THREE.Vector3());
+}
+
+function markEnvironmentConsumers(root: THREE.Object3D | null) {
+  if (!root) {
+    return;
+  }
+
+  root.traverse((node: THREE.Object3D) => {
+    const candidate = node as THREE.Mesh;
+    if (!candidate.isMesh || !candidate.material) {
+      return;
+    }
+
+    const materialList = Array.isArray(candidate.material)
+      ? candidate.material
+      : [candidate.material];
+    const renderableKind = typeof node.userData.renderableKind === "string"
+      ? node.userData.renderableKind
+      : "";
+
+    for (const material of materialList) {
+      if (!(material instanceof THREE.MeshStandardMaterial)) {
+        continue;
+      }
+      material.envMapIntensity =
+        renderableKind === "surface-mesh"
+          ? 1.2
+          : renderableKind === "primitive-plane"
+            ? 0.08
+            : 0.3;
+      material.needsUpdate = true;
+    }
+  });
 }
 
 function clearGroup(group: THREE.Group) {

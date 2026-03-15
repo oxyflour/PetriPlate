@@ -161,6 +161,10 @@ button {
   gap: 4px;
 }
 
+.toolbar-note.toolbar-note-compact {
+  max-width: 32ch;
+}
+
 .toolbar-note strong {
   font-size: 15px;
 }
