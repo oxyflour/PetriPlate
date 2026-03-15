@@ -4,12 +4,29 @@ import {
   toCreasedNormals
 } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { countTriangles } from "./defaults";
+import { GeometryDag, GeometryScope } from "./geometry-dag";
 import type {
   BuildPreviewOptions,
   BuildPreviewResult,
   CrossSectionInstance,
   ManifoldInstance
 } from "./types";
+
+type PhoneFrameDagNodes = {
+  sourceBody: ManifoldInstance;
+  projected: CrossSectionInstance;
+  offsetInner: CrossSectionInstance;
+  inner: CrossSectionInstance;
+  frameSection: CrossSectionInstance;
+  innerVolume: ManifoldInstance;
+  innerBottom: ManifoldInstance;
+  frameResult: ManifoldInstance;
+};
+
+type FrameState = {
+  frameSection: CrossSectionInstance;
+  frameResult: ManifoldInstance;
+};
 
 export function buildPhoneFramePreview({
   config,
@@ -37,199 +54,74 @@ export function buildPhoneFramePreview({
   };
   manifoldMesh.merge?.();
 
-  let sourceBody: ManifoldInstance | null = null;
-  let projected: CrossSectionInstance | null = null;
-  let offsetInner: CrossSectionInstance | null = null;
-  let inner: CrossSectionInstance | null = null;
-  let frameSection: CrossSectionInstance | null = null;
-  let frameRingSection: CrossSectionInstance | null = null;
-  let ribClipArea: CrossSectionInstance | null = null;
-  let innerBottom: ManifoldInstance | null = null;
-  let innerVolume: ManifoldInstance | null = null;
-  let frameResult: ManifoldInstance | null = null;
+  const geometryScope = new GeometryScope();
   const warnings: string[] = [];
 
   try {
-    sourceBody = new runtime.Manifold(manifoldMesh);
-    projected = sourceBody.project();
-    offsetInner = projected.offset(-config.frame.thickness);
-    inner = offsetInner.simplify(Math.max(config.frame.thickness / 18, 1e-4));
+    const booleanOvershoot = getBooleanOvershoot(size, config.frame.thickness);
+    const booleanHeight = size.z + booleanOvershoot * 2;
+    const frameDag = createPhoneFrameDag({
+      scope: geometryScope,
+      sourceBody: new runtime.Manifold(manifoldMesh),
+      thickness: config.frame.thickness,
+      booleanHeight,
+      booleanOvershoot,
+      boundingBox
+    });
+    const inner = frameDag.get("inner");
 
     if (inner.isEmpty()) {
       throw new Error("Inner outline collapsed. Reduce frame.thickness.");
     }
 
-    frameSection = projected.subtract(inner);
+    const baseFrameSection = frameDag.get("frameSection");
 
-    if (frameSection.isEmpty()) {
+    if (baseFrameSection.isEmpty()) {
       throw new Error("Inner outline removed the entire frame.");
     }
 
-    const booleanOvershoot = getBooleanOvershoot(size, config.frame.thickness);
-    const booleanHeight = size.z + booleanOvershoot * 2;
+    const baseFrameResult = frameDag.get("frameResult");
 
-    innerVolume = inner.extrude(booleanHeight, 0, 0);
-    innerBottom = innerVolume.translate(0, 0, boundingBox.min.z-booleanOvershoot);
-    frameResult = sourceBody.subtract(innerBottom);
-
-    if (frameResult.isEmpty()) {
+    if (baseFrameResult.isEmpty()) {
       throw new Error("Frame boolean result is empty.");
     }
 
-    const seamCutDepth = getSeamCutDepth(size, config.frame.thickness);
-    let currentFrameSection = frameSection;
-    let currentFrameResult = frameResult;
-
-    for (const seam of config.frame.seams) {
-      const seamSection = createSeamCutter(
-        runtime,
-        seam.position,
-        seam.distance,
-        seam.width,
-        size,
-        seamCutDepth
-      );
-      const nextFrameSection = currentFrameSection.subtract(seamSection);
-      const seamVolume = seamSection.extrude(booleanHeight, 0, 0, [1, 1], true);
-      const nextFrameResult = currentFrameResult.subtract(seamVolume);
-      const simplifiedFrameSection = nextFrameSection.simplify(Math.max(seam.width / 64, 1e-4));
-
-      tryDelete(seamSection);
-      tryDelete(seamVolume);
-      if (currentFrameSection !== simplifiedFrameSection) {
-        tryDelete(currentFrameSection);
+    let frameState = applySeamCuts({
+      config,
+      runtime,
+      scope: geometryScope,
+      size,
+      booleanHeight,
+      state: {
+        frameSection: baseFrameSection,
+        frameResult: baseFrameResult
       }
-      if (currentFrameResult !== nextFrameResult) {
-        tryDelete(currentFrameResult);
-      }
-      if (nextFrameSection !== simplifiedFrameSection) {
-        tryDelete(nextFrameSection);
-      }
-      currentFrameSection = simplifiedFrameSection;
-      currentFrameResult = nextFrameResult;
-
-      if (currentFrameSection.isEmpty() || currentFrameResult.isEmpty()) {
-        throw new Error("All frame material was removed by seam cuts.");
-      }
-    }
-
-    frameRingSection = currentFrameSection;
-    frameSection = currentFrameSection;
-    frameResult = currentFrameResult;
+    });
+    const frameRingSection = frameState.frameSection;
 
     if (config.frame.seams.length === 0) {
       warnings.push("No seam cuts configured");
     }
 
     if (config.frame.ribs.length > 0) {
-      const ribDepth = getRibDepth(size, config.frame.thickness);
-      const ribJoinOverlap = getRibJoinOverlap(config.frame.thickness);
-      const ribSimplifyEpsilon = 1e-4;
-      const innerBounds = inner.bounds();
-      ribClipArea = frameRingSection.add(inner);
-      let currentFootprintSection = frameSection;
-      let currentFrameResultWithRibs = frameResult;
-
-      for (const [index, rib] of config.frame.ribs.entries()) {
-        let ribRectangle: CrossSectionInstance | null = null;
-        let ribSection: CrossSectionInstance | null = null;
-        let ribAnchor: CrossSectionInstance | null = null;
-        let ribVolumeBase: ManifoldInstance | null = null;
-        let ribVolume: ManifoldInstance | null = null;
-
-        try {
-          ribRectangle = createRibSection(
-            runtime,
-            rib.position,
-            rib.distance,
-            rib.width,
-            innerBounds,
-            ribDepth,
-            ribJoinOverlap
-          );
-          ribSection = ribRectangle.intersect(ribClipArea);
-
-          if (ribSection.isEmpty()) {
-            warnings.push(`Ignored rib ${index + 1}: outside the phone outline.`);
-            continue;
-          }
-
-          const simplifiedRibSection = ribSection.simplify(
-            Math.max(rib.width / 64, ribSimplifyEpsilon)
-          );
-          if (ribSection !== simplifiedRibSection) {
-            tryDelete(ribSection);
-            ribSection = simplifiedRibSection;
-          }
-
-          ribAnchor = ribSection.intersect(frameRingSection);
-          if (ribAnchor.isEmpty()) {
-            warnings.push(`Ignored rib ${index + 1}: does not touch the remaining frame.`);
-            continue;
-          }
-
-          const ribHeight = normalizeRibHeight(rib.thickness, size.z);
-          if (ribHeight !== rib.thickness) {
-            warnings.push(
-              `Clamped rib ${index + 1} thickness from ${formatScalar(rib.thickness)} to ${formatScalar(ribHeight)}.`
-            );
-          }
-
-          const ribOffset = clampRibOffset(rib.offset, ribHeight, size.z);
-          if (ribOffset !== rib.offset) {
-            warnings.push(
-              `Clamped rib ${index + 1} offset from ${formatScalar(rib.offset)} to ${formatScalar(ribOffset)}.`
-            );
-          }
-
-          ribVolumeBase = ribSection.extrude(ribHeight, 0, 0, [1, 1], true);
-          ribVolume =
-            ribOffset === 0 ? ribVolumeBase : ribVolumeBase.translate(0, 0, ribOffset);
-          const nextFrameResult = runtime.Manifold.union([
-            currentFrameResultWithRibs,
-            ribVolume
-          ]);
-          const nextFootprintSection = currentFootprintSection.add(ribSection);
-          const simplifiedFootprintSection = nextFootprintSection.simplify(
-            Math.max(rib.width / 64, ribSimplifyEpsilon)
-          );
-
-          if (currentFrameResultWithRibs !== nextFrameResult) {
-            tryDelete(currentFrameResultWithRibs);
-          }
-          if (
-            currentFootprintSection !== frameRingSection &&
-            currentFootprintSection !== simplifiedFootprintSection
-          ) {
-            tryDelete(currentFootprintSection);
-          }
-          if (nextFootprintSection !== simplifiedFootprintSection) {
-            tryDelete(nextFootprintSection);
-          }
-
-          currentFrameResultWithRibs = nextFrameResult;
-          currentFootprintSection = simplifiedFootprintSection;
-        } finally {
-          tryDelete(ribRectangle);
-          tryDelete(ribSection);
-          tryDelete(ribAnchor);
-          if (ribVolumeBase !== ribVolume) {
-            tryDelete(ribVolumeBase);
-          }
-          tryDelete(ribVolume);
-        }
-      }
-
-      frameResult = currentFrameResultWithRibs;
-      frameSection = currentFootprintSection;
+      frameState = applyRibs({
+        config,
+        runtime,
+        scope: geometryScope,
+        size,
+        inner,
+        frameRingSection,
+        state: frameState,
+        warnings
+      });
     }
 
-    const frameGeometry = manifoldToBufferGeometry(frameResult);
+    const frameGeometry = manifoldToBufferGeometry(frameState.frameResult);
     frameGeometry.computeBoundingBox();
     frameGeometry.computeBoundingSphere();
     frameGeometry.computeVertexNormals();
 
-    const contourCount = frameSection.numContour();
+    const contourCount = frameState.frameSection.numContour();
 
     return {
       sourceGeometry,
@@ -245,19 +137,247 @@ export function buildPhoneFramePreview({
     sourceGeometry.dispose();
     throw error;
   } finally {
-    tryDelete(frameResult);
-    tryDelete(innerVolume);
-    tryDelete(innerBottom);
-    tryDelete(ribClipArea);
-    if (frameRingSection !== frameSection) {
-      tryDelete(frameRingSection);
-    }
-    tryDelete(frameSection);
-    tryDelete(inner);
-    tryDelete(offsetInner);
-    tryDelete(projected);
-    tryDelete(sourceBody);
+    geometryScope.disposeAll();
   }
+}
+
+function createPhoneFrameDag({
+  scope,
+  sourceBody,
+  thickness,
+  booleanHeight,
+  booleanOvershoot,
+  boundingBox
+}: {
+  scope: GeometryScope;
+  sourceBody: ManifoldInstance;
+  thickness: number;
+  booleanHeight: number;
+  booleanOvershoot: number;
+  boundingBox: THREE.Box3;
+}) {
+  return new GeometryDag<PhoneFrameDagNodes>(scope)
+    .input("sourceBody", sourceBody)
+    .node("projected", ["sourceBody"], ({ sourceBody: currentSourceBody }) =>
+      currentSourceBody.project()
+    )
+    .node("offsetInner", ["projected"], ({ projected }) =>
+      projected.offset(-thickness)
+    )
+    .node("inner", ["offsetInner"], ({ offsetInner }) =>
+      offsetInner.simplify(Math.max(thickness / 18, 1e-4))
+    )
+    .node("frameSection", ["projected", "inner"], ({ projected, inner }) =>
+      projected.subtract(inner)
+    )
+    .node("innerVolume", ["inner"], ({ inner }) =>
+      inner.extrude(booleanHeight, 0, 0)
+    )
+    .node("innerBottom", ["innerVolume"], ({ innerVolume }) =>
+      innerVolume.translate(0, 0, boundingBox.min.z - booleanOvershoot)
+    )
+    .node("frameResult", ["sourceBody", "innerBottom"], ({ sourceBody, innerBottom }) =>
+      sourceBody.subtract(innerBottom)
+    );
+}
+
+function applySeamCuts({
+  config,
+  runtime,
+  scope,
+  size,
+  booleanHeight,
+  state
+}: {
+  config: BuildPreviewOptions["config"];
+  runtime: BuildPreviewOptions["runtime"];
+  scope: GeometryScope;
+  size: THREE.Vector3;
+  booleanHeight: number;
+  state: FrameState;
+}): FrameState {
+  const seamCutDepth = getSeamCutDepth(size, config.frame.thickness);
+  let currentFrameSection = state.frameSection;
+  let currentFrameResult = state.frameResult;
+
+  for (const seam of config.frame.seams) {
+    const iterationScope = new GeometryScope();
+
+    try {
+      const seamSection = iterationScope.create(() =>
+        createSeamCutter(
+          runtime,
+          seam.position,
+          seam.distance,
+          seam.width,
+          size,
+          seamCutDepth
+        )
+      );
+      const nextFrameSection = iterationScope.create(() =>
+        currentFrameSection.subtract(seamSection)
+      );
+      const seamVolume = iterationScope.create(() =>
+        seamSection.extrude(booleanHeight, 0, 0, [1, 1], true)
+      );
+      const nextFrameResult = iterationScope.create(() =>
+        currentFrameResult.subtract(seamVolume)
+      );
+      const simplifiedFrameSection = iterationScope.create(() =>
+        nextFrameSection.simplify(Math.max(seam.width / 64, 1e-4))
+      );
+
+      currentFrameSection = scope.replace(
+        currentFrameSection,
+        scope.adopt(iterationScope, simplifiedFrameSection)
+      );
+      currentFrameResult = scope.replace(
+        currentFrameResult,
+        scope.adopt(iterationScope, nextFrameResult)
+      );
+
+      if (currentFrameSection.isEmpty() || currentFrameResult.isEmpty()) {
+        throw new Error("All frame material was removed by seam cuts.");
+      }
+    } finally {
+      iterationScope.disposeAll();
+    }
+  }
+
+  return {
+    frameSection: currentFrameSection,
+    frameResult: currentFrameResult
+  };
+}
+
+function applyRibs({
+  config,
+  runtime,
+  scope,
+  size,
+  inner,
+  frameRingSection,
+  state,
+  warnings
+}: {
+  config: BuildPreviewOptions["config"];
+  runtime: BuildPreviewOptions["runtime"];
+  scope: GeometryScope;
+  size: THREE.Vector3;
+  inner: CrossSectionInstance;
+  frameRingSection: CrossSectionInstance;
+  state: FrameState;
+  warnings: string[];
+}): FrameState {
+  const ribDepth = getRibDepth(size, config.frame.thickness);
+  const ribJoinOverlap = getRibJoinOverlap(config.frame.thickness);
+  const ribSimplifyEpsilon = 1e-4;
+  const innerBounds = inner.bounds();
+  const ribScope = new GeometryScope();
+  let currentFootprintSection = state.frameSection;
+  let currentFrameResult = state.frameResult;
+
+  try {
+    const ribClipArea = ribScope.create(() => frameRingSection.add(inner));
+
+    for (const [index, rib] of config.frame.ribs.entries()) {
+      const iterationScope = new GeometryScope();
+
+      try {
+        const ribRectangle = iterationScope.create(() =>
+          createRibSection(
+            runtime,
+            rib.position,
+            rib.distance,
+            rib.width,
+            innerBounds,
+            ribDepth,
+            ribJoinOverlap
+          )
+        );
+        let ribSection = iterationScope.create(() =>
+          ribRectangle.intersect(ribClipArea)
+        );
+
+        if (ribSection.isEmpty()) {
+          warnings.push(`Ignored rib ${index + 1}: outside the phone outline.`);
+          continue;
+        }
+
+        ribSection = iterationScope.replace(
+          ribSection,
+          iterationScope.create(() =>
+            ribSection.simplify(Math.max(rib.width / 64, ribSimplifyEpsilon))
+          )
+        );
+
+        const ribAnchor = iterationScope.create(() =>
+          ribSection.intersect(frameRingSection)
+        );
+        if (ribAnchor.isEmpty()) {
+          warnings.push(`Ignored rib ${index + 1}: does not touch the remaining frame.`);
+          continue;
+        }
+
+        const ribHeight = normalizeRibHeight(rib.thickness, size.z);
+        if (ribHeight !== rib.thickness) {
+          warnings.push(
+            `Clamped rib ${index + 1} thickness from ${formatScalar(rib.thickness)} to ${formatScalar(ribHeight)}.`
+          );
+        }
+
+        const ribOffset = clampRibOffset(rib.offset, ribHeight, size.z);
+        if (ribOffset !== rib.offset) {
+          warnings.push(
+            `Clamped rib ${index + 1} offset from ${formatScalar(rib.offset)} to ${formatScalar(ribOffset)}.`
+          );
+        }
+
+        const ribVolumeBase = iterationScope.create(() =>
+          ribSection.extrude(ribHeight, 0, 0, [1, 1], true)
+        );
+        const ribVolume =
+          ribOffset === 0
+            ? ribVolumeBase
+            : iterationScope.create(() => ribVolumeBase.translate(0, 0, ribOffset));
+        const nextFrameResult = iterationScope.create(() =>
+          runtime.Manifold.union([currentFrameResult, ribVolume])
+        );
+        const nextFootprintSection = iterationScope.create(() =>
+          currentFootprintSection.add(ribSection)
+        );
+        const simplifiedFootprintSection = iterationScope.create(() =>
+          nextFootprintSection.simplify(Math.max(rib.width / 64, ribSimplifyEpsilon))
+        );
+
+        currentFrameResult = scope.replace(
+          currentFrameResult,
+          scope.adopt(iterationScope, nextFrameResult)
+        );
+
+        const retainedFootprintSection = scope.adopt(
+          iterationScope,
+          simplifiedFootprintSection
+        );
+        if (
+          currentFootprintSection !== frameRingSection &&
+          currentFootprintSection !== retainedFootprintSection
+        ) {
+          scope.dispose(currentFootprintSection);
+        }
+        currentFootprintSection = retainedFootprintSection;
+      } finally {
+        iterationScope.disposeAll();
+      }
+    }
+  } finally {
+    ribScope.disposeAll();
+  }
+
+  return {
+    frameSection: currentFootprintSection,
+    frameResult: currentFrameResult
+  };
 }
 
 function getSeamCutDepth(size: THREE.Vector3, thickness: number) {
@@ -408,14 +528,6 @@ function manifoldToBufferGeometry(manifold: ManifoldInstance) {
   const creased = toCreasedNormals(geometry, Math.PI / 3);
   geometry.dispose();
   return creased;
-}
-
-function tryDelete(candidate: { delete?: () => void } | null) {
-  try {
-    candidate?.delete?.();
-  } catch {
-    // Ignore WASM cleanup failures during teardown.
-  }
 }
 
 function formatScalar(value: number) {

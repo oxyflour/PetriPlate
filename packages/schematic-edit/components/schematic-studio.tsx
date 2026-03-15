@@ -46,6 +46,7 @@ import {
 import SchematicCanvas from "./schematic-canvas";
 
 type StatusTone = "idle" | "loading" | "ready" | "warning" | "error";
+type EditorView = "schematic" | "setup" | "properties";
 
 type TraceDefinition = {
   id: string;
@@ -83,6 +84,7 @@ const PHASE_TRACES: TraceDefinition[] = [
     valueAt: (point) => point.s11PhaseDeg
   }
 ];
+const DEFAULT_PRESET_ID = PRESET_SCHEMATICS[0]?.id ?? "default";
 
 export default function SchematicStudio() {
   const [schematic, setSchematic] = useState<SchematicModel>(() => cloneSchematic(DEFAULT_SCHEMATIC));
@@ -103,6 +105,9 @@ export default function SchematicStudio() {
     text: "Ready to solve graph-connected RLC networks"
   });
   const [solverError, setSolverError] = useState<string | null>(null);
+  const [editorView, setEditorView] = useState<EditorView>("schematic");
+  const [selectedPresetId, setSelectedPresetId] = useState(DEFAULT_PRESET_ID);
+  const [resultsView, setResultsView] = useState<"magnitude" | "phase" | "samples">("magnitude");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -178,6 +183,49 @@ export default function SchematicStudio() {
     ? schematic.edges.find((edge) => edge.id === selectedEdgeId) ?? null
     : null;
   const nodeMap = useMemo(() => new Map(schematic.nodes.map((node) => [node.id, node])), [schematic.nodes]);
+  const sweepSummary = formatSweepSummary(schematic);
+  const selectionSummary = describeWorkspaceSelection(selectedNode, selectedEdge, nodeMap);
+  const solverMode = solverError
+    ? "Fault"
+    : warnings.length > 0
+      ? "Warning"
+      : solution
+        ? "Nominal"
+        : "Idle";
+  const activePreset = PRESET_SCHEMATICS.find((preset) => preset.id === selectedPresetId) ?? PRESET_SCHEMATICS[0];
+  const editorViewCopy = getEditorViewCopy(editorView);
+  const appTitleHint = `${schematic.name} · ${sweepSummary} · ${componentCount} comps · ${schematic.edges.length} wires · ${selectionSummary}`;
+  const resultsTitleHint = `Solved against the active graph topology. ${points.length} samples. ${warnings.length} warnings.`;
+  const inspectorPanel = selectedNode ? (
+    <NodeInspector
+      connectionCount={countNodeConnections(selectedNode.id, schematic.edges)}
+      node={selectedNode}
+      onRemoveNode={() => {
+        removeNode(setSchematic, selectedNode.id);
+        setSelectedNodeId(null);
+      }}
+      onUpdateNode={(patch) => updateNode(setSchematic, selectedNode.id, patch)}
+    />
+  ) : selectedEdge ? (
+    <EdgeInspector
+      edge={selectedEdge}
+      nodeMap={nodeMap}
+      onDelete={() => {
+        removeEdge(setSchematic, selectedEdge.id);
+        setSelectedEdgeId(null);
+      }}
+    />
+  ) : componentCount === 0 ? (
+    <div className="empty-state">
+      <strong>Empty graph</strong>
+      <span>Drag a component into the canvas, then wire it between P1, P2, and ground.</span>
+    </div>
+  ) : (
+    <div className="empty-state">
+      <strong>No selection</strong>
+      <span>Select a node or a wire on the canvas to edit or remove it.</span>
+    </div>
+  );
 
   function replaceSchematic(nextSchematic: SchematicModel) {
     const resolved = cloneSchematic(nextSchematic);
@@ -189,184 +237,225 @@ export default function SchematicStudio() {
 
   return (
     <main className="studio-shell">
-      <section className="hero-panel panel">
-        <div className="hero-copy">
-          <p className="eyebrow">schematic-edit</p>
-          <h1>Microwave Graph Workbench</h1>
-          <p>
-            左边像画图软件一样布置器件和连线，右边实时查看由 <code>scikit-rf</code> 按图拓扑组网求解的
-            <code>S11</code> / <code>S21</code> 曲线。
-          </p>
+      <header className="app-chrome panel">
+        <div className="app-titlebar" title={appTitleHint}>
+          <div className="app-brand">
+            <span className="app-badge">PetriPlate</span>
+            <div className="app-title-copy">
+              <strong>RF Network Workbench</strong>
+              <span title={appTitleHint}>{schematic.name}</span>
+            </div>
+          </div>
+          <div className="app-title-meta">
+            <span className="title-meta-chip" title={summary?.topologyLabel ?? "Topology pending"}>
+              {summary?.topologyLabel ?? "Pending"}
+            </span>
+            <div className={`status-pill ${status.tone}`} title={status.text}>
+              {solverMode}
+            </div>
+          </div>
         </div>
-        <div className={`status-pill ${status.tone}`}>{status.text}</div>
-      </section>
+      </header>
 
       <section className="workspace">
         <section className="panel editor-panel">
-          <header className="section-head">
-            <div>
-              <p className="section-kicker">Editor</p>
-              <h2>Schematic + sweep</h2>
-              <span>Place ports, ground, and two-terminal R / L / C parts anywhere, then wire the graph you want to solve.</span>
+          <header className="section-head" title={editorViewCopy.title}>
+            <div className="section-tabs" aria-label="Editor panels">
+              <button
+                className={`section-tab ${editorView === "schematic" ? "active" : ""}`}
+                onClick={() => setEditorView("schematic")}
+                type="button"
+              >
+                Schematic Editor
+              </button>
+              <button
+                className={`section-tab ${editorView === "setup" ? "active" : ""}`}
+                onClick={() => setEditorView("setup")}
+                type="button"
+              >
+                Network Setup
+              </button>
+              <button
+                className={`section-tab ${editorView === "properties" ? "active" : ""}`}
+                onClick={() => setEditorView("properties")}
+                type="button"
+              >
+                Properties
+              </button>
             </div>
-            <button className="ghost-button" onClick={() => replaceSchematic(DEFAULT_SCHEMATIC)} type="button">
-              Reset
+            <button
+              className="ghost-button"
+              onClick={() => {
+                setSelectedPresetId(DEFAULT_PRESET_ID);
+                replaceSchematic(DEFAULT_SCHEMATIC);
+              }}
+              type="button"
+            >
+              Reset Workspace
             </button>
           </header>
 
-          <div className="editor-grid">
-            <label className="field">
-              <span>Name</span>
-              <input
-                onChange={(event) => {
-                  const nextName = event.currentTarget.value;
-                  setSchematic((current) => ({ ...current, name: nextName }));
+          {editorView === "setup" ? (
+            <div className="editor-mode-panel scroll-panel">
+              <div className="editor-grid">
+                <label className="field">
+                  <span>Name</span>
+                  <input
+                    onChange={(event) => {
+                      const nextName = event.currentTarget.value;
+                      setSchematic((current) => ({ ...current, name: nextName }));
+                    }}
+                    type="text"
+                    value={schematic.name}
+                  />
+                </label>
+                <label className="field">
+                  <span>Port Z0</span>
+                  <input
+                    min="1"
+                    onChange={(event) =>
+                      updateSweepField(setSchematic, "portImpedanceOhm", event.currentTarget.value, 50)
+                    }
+                    step="1"
+                    type="number"
+                    value={schematic.sweep.portImpedanceOhm}
+                  />
+                </label>
+                <label className="field">
+                  <span>Start GHz</span>
+                  <input
+                    min="0.01"
+                    onChange={(event) =>
+                      updateSweepField(setSchematic, "startGhz", event.currentTarget.value, 0.1)
+                    }
+                    step="0.01"
+                    type="number"
+                    value={schematic.sweep.startGhz}
+                  />
+                </label>
+                <label className="field">
+                  <span>Stop GHz</span>
+                  <input
+                    min="0.02"
+                    onChange={(event) =>
+                      updateSweepField(setSchematic, "stopGhz", event.currentTarget.value, 12)
+                    }
+                    step="0.01"
+                    type="number"
+                    value={schematic.sweep.stopGhz}
+                  />
+                </label>
+                <label className="field">
+                  <span>Points</span>
+                  <input
+                    min="11"
+                    onChange={(event) =>
+                      updateSweepField(setSchematic, "points", event.currentTarget.value, 241)
+                    }
+                    step="10"
+                    type="number"
+                    value={schematic.sweep.points}
+                  />
+                </label>
+              </div>
+
+              <div className="button-strip preset-rack">
+                <span className="rack-label">Presets</span>
+                <div className="preset-selector" role="tablist" aria-label="Preset schematics">
+                  {PRESET_SCHEMATICS.map((preset) => (
+                    <button
+                      aria-selected={preset.id === activePreset?.id}
+                      className={`preset-button compact ${preset.id === activePreset?.id ? "active" : ""}`}
+                      key={preset.id}
+                      onClick={() => {
+                        setSelectedPresetId(preset.id);
+                        replaceSchematic(preset.schematic);
+                      }}
+                      role="tab"
+                      title={preset.description}
+                      type="button"
+                    >
+                      <strong>{preset.label}</strong>
+                    </button>
+                  ))}
+                </div>
+                <span className="preset-summary">{activePreset?.description}</span>
+              </div>
+            </div>
+          ) : null}
+
+          {editorView === "schematic" ? (
+            <div className="editor-mode-panel">
+              <SchematicCanvas
+                componentLimitReached={componentLimitReached}
+                edges={schematic.edges}
+                layoutVersion={canvasRevision}
+                nodes={schematic.nodes}
+                onCreateComponent={(kind, position) =>
+                  addComponentNode(
+                    setSchematic,
+                    setSelectedNodeId,
+                    setSelectedEdgeId,
+                    kind,
+                    position
+                  )
+                }
+                onCreateEdge={(from, to) =>
+                  addEdge(setSchematic, setSelectedNodeId, setSelectedEdgeId, from, to)
+                }
+                onDeleteEdge={(edgeId) => {
+                  removeEdge(setSchematic, edgeId);
+                  setSelectedEdgeId((current) => (current === edgeId ? null : current));
                 }}
-                type="text"
-                value={schematic.name}
-              />
-            </label>
-            <label className="field">
-              <span>Port Z0</span>
-              <input
-                min="1"
-                onChange={(event) =>
-                  updateSweepField(setSchematic, "portImpedanceOhm", event.currentTarget.value, 50)
-                }
-                step="1"
-                type="number"
-                value={schematic.sweep.portImpedanceOhm}
-              />
-            </label>
-            <label className="field">
-              <span>Start GHz</span>
-              <input
-                min="0.01"
-                onChange={(event) =>
-                  updateSweepField(setSchematic, "startGhz", event.currentTarget.value, 0.1)
-                }
-                step="0.01"
-                type="number"
-                value={schematic.sweep.startGhz}
-              />
-            </label>
-            <label className="field">
-              <span>Stop GHz</span>
-              <input
-                min="0.02"
-                onChange={(event) =>
-                  updateSweepField(setSchematic, "stopGhz", event.currentTarget.value, 12)
-                }
-                step="0.01"
-                type="number"
-                value={schematic.sweep.stopGhz}
-              />
-            </label>
-            <label className="field">
-              <span>Points</span>
-              <input
-                min="11"
-                onChange={(event) =>
-                  updateSweepField(setSchematic, "points", event.currentTarget.value, 241)
-                }
-                step="10"
-                type="number"
-                value={schematic.sweep.points}
-              />
-            </label>
-          </div>
-
-          <div className="button-strip">
-            {PRESET_SCHEMATICS.map((preset) => (
-              <button
-                className="preset-button"
-                key={preset.id}
-                onClick={() => replaceSchematic(preset.schematic)}
-                type="button"
-              >
-                <strong>{preset.label}</strong>
-                <span>{preset.description}</span>
-              </button>
-            ))}
-          </div>
-
-          <SchematicCanvas
-            componentLimitReached={componentLimitReached}
-            edges={schematic.edges}
-            layoutVersion={canvasRevision}
-            nodes={schematic.nodes}
-            onCreateComponent={(kind, position) =>
-              addComponentNode(
-                setSchematic,
-                setSelectedNodeId,
-                setSelectedEdgeId,
-                kind,
-                position
-              )
-            }
-            onCreateEdge={(from, to) =>
-              addEdge(setSchematic, setSelectedNodeId, setSelectedEdgeId, from, to)
-            }
-            onDeleteEdge={(edgeId) => {
-              removeEdge(setSchematic, edgeId);
-              setSelectedEdgeId((current) => (current === edgeId ? null : current));
-            }}
-            onMoveNode={(nodeId, position) => updateNodePosition(setSchematic, nodeId, position)}
-            onSelectEdge={(edgeId) => {
-              setSelectedNodeId(null);
-              setSelectedEdgeId(edgeId);
-            }}
-            onSelectNode={(nodeId) => {
-              setSelectedEdgeId(null);
-              setSelectedNodeId(nodeId);
-            }}
-            portImpedance={schematic.sweep.portImpedanceOhm}
-            selectedEdgeId={selectedEdgeId}
-            selectedNodeId={selectedNodeId}
-          />
-
-          <div className="selected-component-panel">
-            {selectedNode ? (
-              <NodeInspector
-                connectionCount={countNodeConnections(selectedNode.id, schematic.edges)}
-                node={selectedNode}
-                onRemoveNode={() => {
-                  removeNode(setSchematic, selectedNode.id);
+                onMoveNode={(nodeId, position) => updateNodePosition(setSchematic, nodeId, position)}
+                onSelectEdge={(edgeId) => {
                   setSelectedNodeId(null);
+                  setSelectedEdgeId(edgeId);
                 }}
-                onUpdateNode={(patch) => updateNode(setSchematic, selectedNode.id, patch)}
-              />
-            ) : selectedEdge ? (
-              <EdgeInspector
-                edge={selectedEdge}
-                nodeMap={nodeMap}
-                onDelete={() => {
-                  removeEdge(setSchematic, selectedEdge.id);
+                onSelectNode={(nodeId) => {
                   setSelectedEdgeId(null);
+                  setSelectedNodeId(nodeId);
                 }}
+                portImpedance={schematic.sweep.portImpedanceOhm}
+                selectedEdgeId={selectedEdgeId}
+                selectedNodeId={selectedNodeId}
               />
-            ) : componentCount === 0 ? (
-              <div className="empty-state">
-                <strong>Empty graph</strong>
-                <span>Drag a component into the canvas, then wire it between P1, P2, and ground.</span>
-              </div>
-            ) : (
-              <div className="empty-state">
-                <strong>No selection</strong>
-                <span>Select a node or a wire on the canvas to edit or remove it.</span>
-              </div>
-            )}
-          </div>
+            </div>
+          ) : null}
+
+          {editorView === "properties" ? (
+            <div className="editor-mode-panel scroll-panel">
+              <div className="selected-component-panel properties-panel">{inspectorPanel}</div>
+            </div>
+          ) : null}
         </section>
 
         <section className="panel results-panel">
-          <header className="section-head">
-            <div>
-              <p className="section-kicker">Response</p>
-              <h2>S-parameters</h2>
-              <span>Client edits are proxied through Next.js and solved by the Python backend against the current graph.</span>
+          <header className="section-head" title={resultsTitleHint}>
+            <div className="section-tabs" aria-label="Result panels">
+              <button
+                className={`section-tab ${resultsView === "magnitude" ? "active" : ""}`}
+                onClick={() => setResultsView("magnitude")}
+                type="button"
+              >
+                Magnitude
+              </button>
+              <button
+                className={`section-tab ${resultsView === "phase" ? "active" : ""}`}
+                onClick={() => setResultsView("phase")}
+                type="button"
+              >
+                Phase
+              </button>
+              <button
+                className={`section-tab ${resultsView === "samples" ? "active" : ""}`}
+                onClick={() => setResultsView("samples")}
+                type="button"
+              >
+                Samples
+              </button>
             </div>
-            <div className="result-badge">
+            <div className="result-badge" title={resultsTitleHint}>
               <strong>{summary ? `${summary.componentCount} comps` : "--"}</strong>
               <span>{schematic.name}</span>
             </div>
@@ -391,18 +480,42 @@ export default function SchematicStudio() {
             </article>
           </div>
 
-          <ResponseChart
-            points={points}
-            subtitle="Magnitude in dB"
-            title="S11 / S21 magnitude"
-            traces={MAGNITUDE_TRACES}
-          />
-          <ResponseChart
-            points={points}
-            subtitle="Phase in degrees"
-            title="S11 / S21 phase"
-            traces={PHASE_TRACES}
-          />
+          <div className="results-main">
+            {resultsView === "samples" ? (
+              <div className="sample-table-wrap primary">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Freq</th>
+                      <th>S11</th>
+                      <th>S21</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sampledRows.map((point) => (
+                      <tr key={point.frequencyHz}>
+                        <td>{formatFrequency(point.frequencyHz)}</td>
+                        <td>{formatDb(point.s11Db)}</td>
+                        <td>{formatDb(point.s21Db)}</td>
+                      </tr>
+                    ))}
+                    {sampledRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={3}>Awaiting solver data.</td>
+                      </tr>
+                    ) : null}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <ResponseChart
+                points={points}
+                subtitle={resultsView === "magnitude" ? "Magnitude in dB" : "Phase in degrees"}
+                title={resultsView === "magnitude" ? "S11 / S21 magnitude" : "S11 / S21 phase"}
+                traces={resultsView === "magnitude" ? MAGNITUDE_TRACES : PHASE_TRACES}
+              />
+            )}
+          </div>
 
           <div className="result-footer">
             <div className="warning-list">
@@ -412,32 +525,6 @@ export default function SchematicStudio() {
               {warnings.map((warning) => (
                 <span key={warning}>{warning}</span>
               ))}
-            </div>
-
-            <div className="sample-table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Freq</th>
-                    <th>S11</th>
-                    <th>S21</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sampledRows.map((point) => (
-                    <tr key={point.frequencyHz}>
-                      <td>{formatFrequency(point.frequencyHz)}</td>
-                      <td>{formatDb(point.s11Db)}</td>
-                      <td>{formatDb(point.s21Db)}</td>
-                    </tr>
-                  ))}
-                  {sampledRows.length === 0 ? (
-                    <tr>
-                      <td colSpan={3}>Awaiting solver data.</td>
-                    </tr>
-                  ) : null}
-                </tbody>
-              </table>
             </div>
           </div>
         </section>
@@ -664,9 +751,9 @@ function ResponseChart({
   subtitle: string;
   traces: TraceDefinition[];
 }) {
-  const width = 840;
-  const height = 260;
-  const padding = { top: 20, right: 24, bottom: 34, left: 56 };
+  const width = 760;
+  const height = 180;
+  const padding = { top: 14, right: 16, bottom: 24, left: 42 };
   const values = points.flatMap((point) => traces.map((trace) => trace.valueAt(point)));
   const domain = createDomain(values);
   const minX = points[0]?.frequencyHz ?? 0;
@@ -978,4 +1065,55 @@ function countSolveComponents(schematic: SchematicSolveModel) {
   return schematic.nodes.filter(
     (node) => node.kind === "resistor" || node.kind === "inductor" || node.kind === "capacitor"
   ).length;
+}
+
+function formatSweepSummary(schematic: SchematicModel) {
+  return `${schematic.sweep.startGhz.toFixed(2)}-${schematic.sweep.stopGhz.toFixed(2)} GHz · ${schematic.sweep.points} pts · Z0 ${formatEngineering(schematic.sweep.portImpedanceOhm, 0)} Ohm`;
+}
+
+function describeWorkspaceSelection(
+  selectedNode: SchematicNode | null,
+  selectedEdge: SchematicEdge | null,
+  nodeMap: Map<string, SchematicNode>
+) {
+  if (selectedNode) {
+    return selectedNode.label;
+  }
+
+  if (!selectedEdge) {
+    return "No selection";
+  }
+
+  const fromNode = nodeMap.get(selectedEdge.from.nodeId);
+  const toNode = nodeMap.get(selectedEdge.to.nodeId);
+
+  if (!fromNode || !toNode) {
+    return selectedEdge.id;
+  }
+
+  return `${fromNode.label} -> ${toNode.label}`;
+}
+
+function getEditorViewCopy(editorView: EditorView) {
+  if (editorView === "setup") {
+    return {
+      kicker: "Network Setup",
+      title: "Adjust sweep bounds, port impedance, and load a preset topology into the workspace.",
+      chips: ["Sweep controls", "Preset loader", "Project naming"]
+    };
+  }
+
+  if (editorView === "properties") {
+    return {
+      kicker: "Selection Properties",
+      title: "Inspect and edit the currently selected node or wire without crowding the canvas.",
+      chips: ["Node inspector", "Wire inspector", "Delete selection"]
+    };
+  }
+
+  return {
+    kicker: "Editing Surface",
+    title: "Place ports, ground, and R / L / C parts, then wire the exact graph you want to solve.",
+    chips: ["Blank drag pans canvas", "Wheel zoom", "Delete removes selection"]
+  };
 }

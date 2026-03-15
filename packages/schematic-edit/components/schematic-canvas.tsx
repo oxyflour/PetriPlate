@@ -476,7 +476,7 @@ export default function SchematicCanvas({
       <div className="canvas-head">
         <div>
           <strong>Graph canvas</strong>
-          <span>拖入 R / L / C 节点，拖动端点拉线，点击导线后可删除。滚轮缩放，拖拽空白区平移。</span>
+          <span>Load parts from the rack, wire terminals directly, and drag blank space to reposition the work area.</span>
         </div>
         <div className="canvas-selection">
           <strong>{selectedNode || selectedEdge ? "Selected" : "Canvas"}</strong>
@@ -561,11 +561,18 @@ export default function SchematicCanvas({
               />
             </pattern>
             <filter height="160%" id="canvas-glow" width="160%" x="-30%" y="-30%">
-              <feDropShadow dx="0" dy="14" floodColor="rgba(0, 0, 0, 0.38)" stdDeviation="16" />
+              <feDropShadow dx="0" dy="8" floodColor="rgba(0, 0, 0, 0.28)" stdDeviation="8" />
             </filter>
           </defs>
 
-          <rect className="canvas-hit-area" fill="rgba(4, 10, 18, 0.96)" height={VIEWPORT_HEIGHT} rx="26" width={VIEWPORT_WIDTH} />
+          <rect
+            className="canvas-hit-area"
+            fill="rgba(4, 10, 18, 0.96)"
+            height={VIEWPORT_HEIGHT}
+            onPointerDown={beginPan}
+            rx="10"
+            width={VIEWPORT_WIDTH}
+          />
 
           <g transform={transform}>
             <rect
@@ -573,14 +580,19 @@ export default function SchematicCanvas({
               fill="rgba(5, 12, 23, 0.94)"
               filter="url(#canvas-glow)"
               height={WORLD_HEIGHT}
-              onPointerDown={beginPan}
-              rx="34"
+              pointerEvents="none"
+              rx="12"
               width={WORLD_WIDTH}
             />
-            <rect fill="url(#canvas-grid)" height={WORLD_HEIGHT} rx="34" width={WORLD_WIDTH} />
-
-            <circle cx="240" cy="170" fill="rgba(123, 224, 210, 0.08)" r="156" />
-            <circle cx="1540" cy="860" fill="rgba(255, 176, 103, 0.08)" r="190" />
+            <rect fill="url(#canvas-grid)" height={WORLD_HEIGHT} pointerEvents="none" rx="12" width={WORLD_WIDTH} />
+            <rect
+              className="canvas-pan-hit"
+              fill="rgba(0, 0, 0, 0)"
+              height={WORLD_HEIGHT}
+              onPointerDown={beginPan}
+              rx="12"
+              width={WORLD_WIDTH}
+            />
 
             {edgePaths.map(({ edge, d }) => {
               const isSelected = edge.id === selectedEdgeId;
