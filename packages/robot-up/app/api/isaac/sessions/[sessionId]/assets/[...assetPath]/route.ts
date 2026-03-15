@@ -37,6 +37,15 @@ function getContentType(filePath: string) {
   if (extension === ".urdf") {
     return "text/plain; charset=utf-8";
   }
+  if (extension === ".dae") {
+    return "model/vnd.collada+xml; charset=utf-8";
+  }
+  if (extension === ".obj") {
+    return "text/plain; charset=utf-8";
+  }
+  if (extension === ".stl") {
+    return "model/stl";
+  }
   if (extension === ".png") {
     return "image/png";
   }

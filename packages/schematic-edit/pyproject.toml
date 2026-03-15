@@ -1,0 +1,15 @@
+[project]
+name = "petriplate-schematic-edit"
+version = "0.1.0"
+description = "scikit-rf backend for the PetriPlate schematic editor"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.116.1",
+  "numpy>=2.3.3",
+  "scikit-rf>=1.8.0",
+  "uvicorn>=0.35.0",
+]
+
+[tool.uv]
+package = false

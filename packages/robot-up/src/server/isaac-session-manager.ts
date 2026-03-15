@@ -258,7 +258,9 @@ function spawnBridgeProcess(input: {
       "--host",
       "127.0.0.1",
       "--port",
-      String(input.port)
+      String(input.port),
+      "--publish-hz",
+      "12"
     ],
     {
       cwd: PACKAGE_ROOT,
@@ -541,6 +543,11 @@ function compareIsaacCandidates(left: string, right: string) {
   if (leftWeight !== rightWeight) {
     return leftWeight - rightWeight;
   }
+  const leftRoleWeight = isaacStageRolePriority(left);
+  const rightRoleWeight = isaacStageRolePriority(right);
+  if (leftRoleWeight !== rightRoleWeight) {
+    return leftRoleWeight - rightRoleWeight;
+  }
   return left.localeCompare(right);
 }
 
@@ -558,6 +565,26 @@ function isaacExtensionPriority(extension: string) {
     return 3;
   }
   return 4;
+}
+
+function isaacStageRolePriority(candidatePath: string) {
+  const normalizedPath = candidatePath.replace(/\\/g, "/").toLowerCase();
+  const fileName = path.posix.basename(normalizedPath);
+  const isCompanionStage =
+    fileName.includes("_base.") ||
+    fileName.includes("_physics.") ||
+    fileName.includes("_sensor.") ||
+    fileName.includes("_robot.");
+  if (!isCompanionStage && !normalizedPath.includes("/configuration/")) {
+    return 0;
+  }
+  if (!isCompanionStage) {
+    return 1;
+  }
+  if (fileName.includes("_base.")) {
+    return 3;
+  }
+  return 2;
 }
 
 async function allocatePort(): Promise<number> {

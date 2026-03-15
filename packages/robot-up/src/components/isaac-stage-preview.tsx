@@ -32,6 +32,7 @@ export default function IsaacStagePreview({
   const controlsRef = useRef<OrbitControls | null>(null);
   const stageRootRef = useRef<THREE.Group | null>(null);
   const primNodesRef = useRef<Map<string, THREE.Group>>(new Map());
+  const needsFrameRefitRef = useRef(false);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -41,7 +42,6 @@ export default function IsaacStagePreview({
 
     const scene3d = new THREE.Scene();
     scene3d.background = new THREE.Color("#081017");
-    scene3d.fog = new THREE.Fog("#081017", 10, 30);
 
     const camera = new THREE.PerspectiveCamera(
       48,
@@ -108,6 +108,7 @@ export default function IsaacStagePreview({
       controls.dispose();
       controlsRef.current = null;
       primNodesRef.current = new Map();
+      needsFrameRefitRef.current = false;
       if (stageRootRef.current) {
         clearGroup(stageRootRef.current);
       }
@@ -125,6 +126,7 @@ export default function IsaacStagePreview({
     }
 
     primNodesRef.current = new Map();
+    needsFrameRefitRef.current = false;
     clearGroup(stageRoot);
 
     if (!manifest?.prims.length) {
@@ -165,6 +167,7 @@ export default function IsaacStagePreview({
     }
 
     primNodesRef.current = primNodes;
+    needsFrameRefitRef.current = true;
     fitCamera(
       cameraRef.current,
       controlsRef.current,
@@ -178,7 +181,8 @@ export default function IsaacStagePreview({
   }, [assetBaseUrl, manifest]);
 
   useEffect(() => {
-    if (!frame?.prims.length) {
+    const stageRoot = stageRootRef.current;
+    if (!frame?.prims.length || !stageRoot) {
       return;
     }
 
@@ -195,12 +199,20 @@ export default function IsaacStagePreview({
       applyTransform(node, prim.position, prim.quaternion, prim.scale);
       node.visible = prim.visible;
     }
+
+    if (needsFrameRefitRef.current) {
+      fitCamera(cameraRef.current, controlsRef.current, [...stageRoot.children]);
+      needsFrameRefitRef.current = false;
+    }
   }, [frame]);
 
   return <div className="preview-canvas" ref={mountRef} />;
 }
 
 function createPrimRenderableNode(prim: IsaacStagePrim, assetBaseUrl: string | null) {
+  if (!shouldDisplayPrim(prim)) {
+    return null;
+  }
   if (prim.renderable) {
     return createRenderableNode(prim.renderable, prim, assetBaseUrl);
   }
@@ -506,6 +518,14 @@ function applyAxisOrientation(target: THREE.Object3D, axis: IsaacStageRenderable
   if (axis === "Z") {
     target.rotation.x = Math.PI / 2;
   }
+}
+
+function shouldDisplayPrim(prim: IsaacStagePrim) {
+  const normalizedPath = prim.path.toLowerCase();
+  if (normalizedPath.includes("/collisions/") || normalizedPath.includes("_collision")) {
+    return false;
+  }
+  return prim.purpose !== "guide";
 }
 
 function pickPrimColor(type: string) {

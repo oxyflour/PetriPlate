@@ -680,6 +680,30 @@ code {
   }
 }
 
+@media (max-width: 1366px) and (max-height: 860px) {
+  .lab-shell {
+    height: auto;
+    overflow: visible;
+  }
+
+  .dashboard {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+    min-height: auto;
+    overflow: visible;
+  }
+
+  .preview-panel {
+    grid-row: auto;
+    min-height: 520px;
+  }
+
+  .callout-list,
+  .entry-list {
+    max-height: 240px;
+  }
+}
+
 @media (max-width: 720px) {
   .lab-shell {
     height: auto;

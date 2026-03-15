@@ -116,37 +116,6 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
-  packages/mega-brdf:
-    dependencies:
-      '@monaco-editor/react':
-        specifier: ^4.7.0
-        version: 4.7.0(monaco-editor@0.55.1)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
-      next:
-        specifier: ^16.1.6
-        version: 16.1.6(@opentelemetry/api@1.9.0)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
-      react:
-        specifier: ^18.3.1
-        version: 18.3.1
-      react-dom:
-        specifier: ^18.3.1
-        version: 18.3.1(react@18.3.1)
-    devDependencies:
-      '@types/node':
-        specifier: ^25.3.3
-        version: 25.3.3
-      '@types/react':
-        specifier: ^18.3.28
-        version: 18.3.28
-      '@types/react-dom':
-        specifier: ^18.3.7
-        version: 18.3.7(@types/react@18.3.28)
-      '@webgpu/types':
-        specifier: ^0.1.65
-        version: 0.1.69
-      typescript:
-        specifier: ^5.9.3
-        version: 5.9.3
-
   packages/mega-gpu:
     dependencies:
       '@monaco-editor/react':
@@ -212,11 +181,8 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
-  packages/robot-up2:
+  packages/schematic-edit:
     dependencies:
-      jszip:
-        specifier: ^3.10.1
-        version: 3.10.1
       next:
         specifier: ^16.1.6
         version: 16.1.6(@opentelemetry/api@1.9.0)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -226,9 +192,6 @@ importers:
       react-dom:
         specifier: ^18.3.1
         version: 18.3.1(react@18.3.1)
-      three:
-        specifier: ^0.181.1
-        version: 0.181.2
     devDependencies:
       '@types/node':
         specifier: ^25.3.3
@@ -239,9 +202,6 @@ importers:
       '@types/react-dom':
         specifier: ^18.3.7
         version: 18.3.7(@types/react@18.3.28)
-      '@types/three':
-        specifier: ^0.181.0
-        version: 0.181.0
       typescript:
         specifier: ^5.9.3
         version: 5.9.3

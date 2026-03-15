@@ -3,7 +3,11 @@ export const SAMPLE_SCENE_PATH = "sample/scene.xml";
 export const SAMPLE_ARM_PATH = "sample/industrial-arm.xml";
 export const SAMPLE_MESH_PATH = "sample/assets/base_shell.obj";
 export const SAMPLE_ISAAC_ASSET_NAME = "sample://factory-stage";
-export const SAMPLE_STAGE_PATH = "sample/factory-cell.usda";
+export const SAMPLE_STAGE_PATH = "sample-factory-cell.usda";
+export const SAMPLE_FRANKA_ASSET_NAME = "sample://official-franka";
+export const SAMPLE_FRANKA_STAGE_PATH = "official-franka-wrapper.usda";
+export const OFFICIAL_FRANKA_USD_URL =
+  "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd";
 
 export const SAMPLE_SCENE_MJCF = `<mujoco model="industrial_arm_scene">
   <include file="industrial-arm.xml" />
@@ -149,5 +153,18 @@ def Xform "World"
             uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
+}
+`;
+
+export const SAMPLE_FRANKA_STAGE_USDA = `#usda 1.0
+(
+    defaultPrim = "FrankaPreview"
+    upAxis = "Z"
+)
+
+def Xform "FrankaPreview" (
+    prepend references = @${OFFICIAL_FRANKA_USD_URL}@
+)
+{
 }
 `;

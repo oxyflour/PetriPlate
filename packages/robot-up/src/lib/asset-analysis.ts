@@ -3,6 +3,9 @@ import { parseMjcfScene } from "./mjcf-parser";
 import {
   SAMPLE_ASSET_NAME,
   SAMPLE_ARM_PATH,
+  SAMPLE_FRANKA_ASSET_NAME,
+  SAMPLE_FRANKA_STAGE_PATH,
+  SAMPLE_FRANKA_STAGE_USDA,
   SAMPLE_ISAAC_ASSET_NAME,
   SAMPLE_MESH_PATH,
   SAMPLE_SCENE_MJCF,
@@ -84,6 +87,22 @@ export async function createSampleIsaacAssetAnalysis(): Promise<AssetAnalysis> {
   });
 }
 
+export async function createSampleFrankaAssetAnalysis(): Promise<AssetAnalysis> {
+  return buildAnalysis({
+    sourceName: SAMPLE_FRANKA_ASSET_NAME,
+    sourceKind: "sample",
+    entries: [
+      {
+        path: SAMPLE_FRANKA_STAGE_PATH,
+        size: new TextEncoder().encode(SAMPLE_FRANKA_STAGE_USDA).byteLength,
+        extension: "usda",
+        kind: "isaac-stage",
+        text: SAMPLE_FRANKA_STAGE_USDA
+      }
+    ]
+  });
+}
+
 export async function createSampleAssetFile(): Promise<File> {
   const archive = new JSZip();
   archive.file(SAMPLE_SCENE_PATH, SAMPLE_SCENE_MJCF);
@@ -98,6 +117,12 @@ export async function createSampleAssetFile(): Promise<File> {
 
 export async function createSampleIsaacAssetFile(): Promise<File> {
   return new File([SAMPLE_STAGE_USDA], "sample-factory-cell.usda", {
+    type: "text/plain"
+  });
+}
+
+export async function createSampleFrankaAssetFile(): Promise<File> {
+  return new File([SAMPLE_FRANKA_STAGE_USDA], SAMPLE_FRANKA_STAGE_PATH, {
     type: "text/plain"
   });
 }
@@ -429,6 +454,11 @@ function compareIsaacEntries(left: AssetFileEntry, right: AssetFileEntry) {
   if (leftWeight !== rightWeight) {
     return leftWeight - rightWeight;
   }
+  const leftRoleWeight = isaacStageRolePriority(left.path);
+  const rightRoleWeight = isaacStageRolePriority(right.path);
+  if (leftRoleWeight !== rightRoleWeight) {
+    return leftRoleWeight - rightRoleWeight;
+  }
   return left.path.localeCompare(right.path);
 }
 
@@ -446,6 +476,26 @@ function isaacEntryPriority(extension: string) {
     return 3;
   }
   return 4;
+}
+
+function isaacStageRolePriority(path: string) {
+  const normalizedPath = path.replace(/\\/g, "/").toLowerCase();
+  const fileName = normalizedPath.split("/").pop() || normalizedPath;
+  const isCompanionStage =
+    fileName.includes("_base.") ||
+    fileName.includes("_physics.") ||
+    fileName.includes("_sensor.") ||
+    fileName.includes("_robot.");
+  if (!isCompanionStage && !normalizedPath.includes("/configuration/")) {
+    return 0;
+  }
+  if (!isCompanionStage) {
+    return 1;
+  }
+  if (fileName.includes("_base.")) {
+    return 3;
+  }
+  return 2;
 }
 
 function createObjectUrl(blob: Blob): string {

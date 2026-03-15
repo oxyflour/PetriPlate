@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import math
+import numpy as np
 import sys
 import threading
 import time
@@ -95,15 +96,89 @@ def load_isaac_runtime() -> tuple[Any, dict[str, Any]]:
     from isaacsim import SimulationApp
 
     app = SimulationApp({"headless": True})
-    from pxr import Gf, Usd, UsdGeom
+    import omni.usd
+    from isaacsim.core.api import World
+    from isaacsim.core.prims import SingleArticulation
+    from isaacsim.core.utils.xforms import get_local_pose
+    from isaacsim.core.utils.types import ArticulationAction
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
-    return app, {"Gf": Gf, "Usd": Usd, "UsdGeom": UsdGeom}
+    return app, {
+        "ArticulationAction": ArticulationAction,
+        "Gf": Gf,
+        "Sdf": Sdf,
+        "SingleArticulation": SingleArticulation,
+        "Usd": Usd,
+        "UsdGeom": UsdGeom,
+        "UsdPhysics": UsdPhysics,
+        "World": World,
+        "get_local_pose": get_local_pose,
+        "omni_usd": omni.usd,
+    }
 
 
 def resolve_runtime_stage_assets(app: Any, asset_path: Path) -> list[Path]:
     if asset_path.suffix.lower() in {".urdf", ".xml"}:
         return import_urdf_as_stage(app, asset_path)
-    return [asset_path]
+    return collect_stage_candidate_paths(asset_path)
+
+
+def append_stage_candidate(
+    candidate_paths: list[Path],
+    seen_paths: set[Path],
+    candidate_path: Path,
+) -> None:
+    resolved_path = candidate_path.resolve()
+    if not candidate_path.exists() or resolved_path in seen_paths:
+        return
+    seen_paths.add(resolved_path)
+    candidate_paths.append(candidate_path)
+
+
+def collect_stage_candidate_paths(asset_path: Path) -> list[Path]:
+    candidate_paths: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    append_stage_candidate(candidate_paths, seen_paths, asset_path)
+
+    if asset_path.suffix.lower() not in {".usd", ".usda", ".usdc"}:
+        return candidate_paths
+
+    for extension in (".usd", ".usda", ".usdc"):
+        append_stage_candidate(
+            candidate_paths,
+            seen_paths,
+            asset_path.with_name(f"{asset_path.stem}_base{extension}"),
+        )
+        append_stage_candidate(
+            candidate_paths,
+            seen_paths,
+            asset_path.parent / "configuration" / f"{asset_path.stem}_base{extension}",
+        )
+
+    primary_stem = derive_primary_stage_stem(asset_path)
+    if primary_stem:
+        search_roots = [asset_path.parent]
+        if asset_path.parent.name.lower() == "configuration" and asset_path.parent.parent.exists():
+            search_roots.insert(0, asset_path.parent.parent)
+        for search_root in search_roots:
+            for extension in (".usda", ".usd", ".usdc"):
+                append_stage_candidate(
+                    candidate_paths,
+                    seen_paths,
+                    search_root / f"{primary_stem}{extension}",
+                )
+
+    return candidate_paths
+
+
+def derive_primary_stage_stem(asset_path: Path) -> str | None:
+    suffixes = ("_base", "_physics", "_sensor", "_robot")
+    stem = asset_path.stem
+    for suffix in suffixes:
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            return stem[: -len(suffix)]
+    return None
 
 
 def import_urdf_as_stage(app: Any, asset_path: Path) -> list[Path]:
@@ -154,24 +229,12 @@ def import_urdf_as_stage(app: Any, asset_path: Path) -> list[Path]:
             f" Command returned path: {imported_path!r}"
         )
 
-    candidate_paths: list[Path] = []
-    seen_paths: set[Path] = set()
-
-    def append_candidate(candidate_path: Path) -> None:
-        resolved_path = candidate_path.resolve()
-        if not candidate_path.exists() or resolved_path in seen_paths:
-            return
-        seen_paths.add(resolved_path)
-        candidate_paths.append(candidate_path)
-
-    append_candidate(imported_stage_path)
-    append_candidate(
-        imported_stage_path.parent
-        / "configuration"
-        / f"{imported_stage_path.stem}_base.usd"
-    )
-    append_candidate(
-        imported_stage_path.parent / "configuration" / f"{asset_path.stem}_base.usd"
+    candidate_paths = collect_stage_candidate_paths(imported_stage_path)
+    seen_paths = {candidate_path.resolve() for candidate_path in candidate_paths}
+    append_stage_candidate(
+        candidate_paths,
+        seen_paths,
+        imported_stage_path.parent / "configuration" / f"{asset_path.stem}_base.usd",
     )
 
     return candidate_paths
@@ -242,6 +305,29 @@ def matrix_to_pose(matrix: Any, Gf: Any) -> tuple[dict[str, float], dict[str, fl
     rotation = transform.GetRotation().GetQuat()
     scale = transform.GetScale()
     return vec3_payload(translation), quat_payload(rotation), vec3_payload(scale)
+
+
+def compute_runtime_local_pose(
+    prim: Any,
+    modules: dict[str, Any],
+) -> tuple[dict[str, float] | None, dict[str, float] | None]:
+    get_local_pose = modules.get("get_local_pose")
+    UsdGeom = modules["UsdGeom"]
+
+    if get_local_pose is None or not prim.IsA(UsdGeom.Xformable):
+        return None, None
+
+    try:
+        live_position, live_orientation = get_local_pose(prim.GetPath().pathString)
+    except Exception:
+        return None, None
+
+    return vec3_payload(live_position), {
+        "w": float(live_orientation[0]),
+        "x": float(live_orientation[1]),
+        "y": float(live_orientation[2]),
+        "z": float(live_orientation[3]),
+    }
 
 
 def compute_bbox(
@@ -335,6 +421,8 @@ def build_stage_manifest(
     stage_path: Path,
     active_time_code: float,
     modules: dict[str, Any],
+    *,
+    prefer_runtime_pose: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     Usd = modules["Usd"]
     UsdGeom = modules["UsdGeom"]
@@ -358,8 +446,13 @@ def build_stage_manifest(
         path = prim.GetPath().pathString
         tracked_paths.append(path)
 
+        runtime_position, runtime_quaternion = (
+            compute_runtime_local_pose(prim, modules) if prefer_runtime_pose else (None, None)
+        )
         local_matrix = compute_local_matrix(prim, time_code, Gf, UsdGeom)
-        position, quaternion, scale = matrix_to_pose(local_matrix, Gf)
+        fallback_position, fallback_quaternion, scale = matrix_to_pose(local_matrix, Gf)
+        position = runtime_position or fallback_position
+        quaternion = runtime_quaternion or fallback_quaternion
         bbox_min, bbox_max = compute_bbox(prim, time_code, UsdGeom, bbox_cache)
         has_geometry = is_geometry_prim(prim, UsdGeom)
         renderable = build_renderable_payload(prim, time_code, UsdGeom) if has_geometry else None
@@ -556,6 +649,47 @@ def resolve_urdf_asset_path(
     return None
 
 
+def derive_urdf_source_stem(stage_stem: str) -> str:
+    normalized_stem = stage_stem
+    for suffix in ("_base", "_physics", "_sensor", "_robot"):
+        if normalized_stem.endswith(suffix) and len(normalized_stem) > len(suffix):
+            normalized_stem = normalized_stem[: -len(suffix)]
+            break
+
+    for suffix in (".imported", "_imported"):
+        if normalized_stem.endswith(suffix) and len(normalized_stem) > len(suffix):
+            normalized_stem = normalized_stem[: -len(suffix)]
+            break
+
+    return normalized_stem
+
+
+def resolve_urdf_visual_source(asset_path: Path, stage_asset_path: Path) -> Path | None:
+    if is_urdf_asset(asset_path):
+        return asset_path
+
+    candidate_roots = [asset_path.parent]
+    if stage_asset_path.parent.name.lower() == "configuration" and stage_asset_path.parent.parent.exists():
+        candidate_roots.append(stage_asset_path.parent.parent)
+    elif stage_asset_path.parent not in candidate_roots:
+        candidate_roots.append(stage_asset_path.parent)
+
+    candidate_stems: list[str] = []
+    for raw_stem in (asset_path.stem, stage_asset_path.stem):
+        normalized_stem = derive_urdf_source_stem(raw_stem)
+        if normalized_stem and normalized_stem not in candidate_stems:
+            candidate_stems.append(normalized_stem)
+
+    for root in candidate_roots:
+        for stem in candidate_stems:
+            for extension in (".urdf", ".xml"):
+                candidate = root / f"{stem}{extension}"
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+
+    return None
+
+
 def find_link_parent_path(stage_manifest: dict[str, Any], link_name: str) -> str | None:
     candidates = [
         prim["path"]
@@ -573,6 +707,31 @@ def increment_parent_child_count(stage_manifest: dict[str, Any], parent_path: st
         if prim.get("path") == parent_path:
             prim["childCount"] = int(prim.get("childCount", 0)) + 1
             return
+
+
+def is_visualized_stage_path(path: str) -> bool:
+    normalized_path = path.lower()
+    return "/collisions/" not in normalized_path and "_collision" not in normalized_path
+
+
+def link_has_visible_renderable(stage_manifest: dict[str, Any], parent_path: str) -> bool:
+    normalized_parent_path = parent_path.rstrip("/")
+    child_prefix = f"{normalized_parent_path}/"
+
+    for prim in stage_manifest.get("prims", []):
+        prim_path = prim.get("path")
+        if not isinstance(prim_path, str):
+            continue
+        if prim_path != normalized_parent_path and not prim_path.startswith(child_prefix):
+            continue
+        if not is_visualized_stage_path(prim_path):
+            continue
+        if prim.get("purpose") == "guide":
+            continue
+        if prim.get("renderable") is not None:
+            return True
+
+    return False
 
 
 def build_urdf_visual_fallback_prims(
@@ -606,6 +765,8 @@ def build_urdf_visual_fallback_prims(
 
         parent_path = find_link_parent_path(stage_manifest, link_name)
         if not parent_path:
+            continue
+        if link_has_visible_renderable(stage_manifest, parent_path):
             continue
 
         visuals = link.findall("visual")
@@ -720,6 +881,351 @@ def build_urdf_visual_fallback_prims(
     return synthetic_prims
 
 
+def open_stage_in_runtime_context(
+    app: Any,
+    stage_asset_path: Path,
+    modules: dict[str, Any],
+) -> Any:
+    usd_context = modules["omni_usd"].get_context()
+    resolved_stage_path = str(stage_asset_path.resolve())
+
+    if hasattr(usd_context, "open_stage"):
+        open_result = usd_context.open_stage(resolved_stage_path)
+        if open_result is False:
+            raise RuntimeError(f"Isaac runtime could not open {resolved_stage_path}.")
+    else:
+        raise RuntimeError("Isaac runtime does not expose omni.usd stage opening APIs.")
+
+    stage = None
+    matched_stage = None
+    for _attempt in range(120):
+        app.update()
+        stage = usd_context.get_stage()
+        if stage is None:
+            continue
+
+        try:
+            root_layer = stage.GetRootLayer()
+            stage_identifier = str(
+                getattr(root_layer, "realPath", "")
+                or getattr(root_layer, "resolvedPath", "")
+                or root_layer.identifier
+            )
+        except Exception:
+            stage_identifier = ""
+
+        if not stage_identifier:
+            continue
+
+        normalized_identifier = stage_identifier.replace("\\", "/")
+        normalized_target = resolved_stage_path.replace("\\", "/")
+        if (
+            normalized_identifier == normalized_target
+            or normalized_identifier.endswith(f"/{stage_asset_path.name}")
+            or normalized_identifier.endswith(f"\\{stage_asset_path.name}")
+        ):
+            matched_stage = stage
+            break
+
+    if matched_stage is None:
+        raise RuntimeError(f"Isaac runtime stage did not become available for {resolved_stage_path}.")
+
+    stage = matched_stage
+    try:
+        stage.Load()
+    except Exception:
+        pass
+
+    return stage
+
+
+def find_existing_physics_scene_path(stage: Any, modules: dict[str, Any]) -> str | None:
+    Usd = modules["Usd"]
+    UsdPhysics = modules["UsdPhysics"]
+
+    for prim in iter_stage_prims(stage, Usd):
+        type_name = prim.GetTypeName() or ""
+        if type_name == "PhysicsScene":
+            return prim.GetPath().pathString
+        try:
+            if prim.IsA(UsdPhysics.Scene):
+                return prim.GetPath().pathString
+        except Exception:
+            continue
+
+    return None
+
+
+def ensure_physics_scene(stage: Any, modules: dict[str, Any]) -> str:
+    existing_path = find_existing_physics_scene_path(stage, modules)
+    if existing_path:
+        return existing_path
+
+    UsdPhysics = modules["UsdPhysics"]
+    Sdf = modules["Sdf"]
+    Gf = modules["Gf"]
+
+    candidate_paths = ["/PhysicsScene"]
+    default_prim = stage.GetDefaultPrim()
+    if default_prim and default_prim.IsValid():
+        candidate_paths.insert(0, f"{default_prim.GetPath().pathString}/PhysicsScene")
+    if stage.GetPrimAtPath("/World").IsValid():
+        candidate_paths.insert(0, "/World/PhysicsScene")
+
+    scene_prim_path: str | None = None
+    for candidate_path in candidate_paths:
+        if stage.GetPrimAtPath(candidate_path).IsValid():
+            scene_prim_path = candidate_path
+            break
+        try:
+            physics_scene = UsdPhysics.Scene.Define(stage, Sdf.Path(candidate_path))
+            physics_scene.CreateGravityDirectionAttr().Set(Gf.Vec3f(0.0, 0.0, -1.0))
+            physics_scene.CreateGravityMagnitudeAttr().Set(9.81)
+            scene_prim_path = candidate_path
+            break
+        except Exception:
+            continue
+
+    if not scene_prim_path:
+        raise RuntimeError("Isaac runtime could not create a PhysicsScene for articulation stepping.")
+
+    return scene_prim_path
+
+
+def find_articulation_root_paths(stage: Any, modules: dict[str, Any]) -> list[str]:
+    Usd = modules["Usd"]
+    UsdPhysics = modules["UsdPhysics"]
+    root_paths: list[str] = []
+
+    for prim in iter_stage_prims(stage, Usd):
+        try:
+            if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+                root_paths.append(prim.GetPath().pathString)
+        except Exception:
+            continue
+
+    root_paths.sort(key=lambda value: (value.count("/"), len(value)))
+    return root_paths
+
+
+def flatten_float_array(values: Any) -> np.ndarray:
+    return np.asarray(values, dtype=np.float64).reshape(-1)
+
+
+def normalize_joint_limits(raw_limits: Any, dof_count: int) -> tuple[np.ndarray, np.ndarray]:
+    flat_limits = np.asarray(raw_limits, dtype=np.float64)
+    if flat_limits.size == 0:
+        lower = np.full(dof_count, -math.inf, dtype=np.float64)
+        upper = np.full(dof_count, math.inf, dtype=np.float64)
+        return lower, upper
+
+    if flat_limits.ndim == 3:
+        flat_limits = flat_limits[0]
+    if flat_limits.ndim == 2 and flat_limits.shape[1] >= 2:
+        lower = flat_limits[:, 0].reshape(-1)
+        upper = flat_limits[:, 1].reshape(-1)
+        if lower.size >= dof_count and upper.size >= dof_count:
+            return lower[:dof_count], upper[:dof_count]
+
+    lower = np.full(dof_count, -math.inf, dtype=np.float64)
+    upper = np.full(dof_count, math.inf, dtype=np.float64)
+    return lower, upper
+
+
+def select_driven_joint_indices(joint_names: list[str], max_joint_count: int = 3) -> list[int]:
+    preferred_indices = [
+        index
+        for index, joint_name in enumerate(joint_names)
+        if "finger" not in joint_name.lower() and "gripper" not in joint_name.lower()
+    ]
+    if not preferred_indices:
+        preferred_indices = list(range(len(joint_names)))
+    return preferred_indices[: max(1, min(max_joint_count, len(preferred_indices)))]
+
+
+class ArticulationSineDriver:
+    def __init__(
+        self,
+        stage: Any,
+        stage_asset_path: Path,
+        modules: dict[str, Any],
+        physics_dt: float,
+    ) -> None:
+        World = modules["World"]
+        SingleArticulation = modules["SingleArticulation"]
+
+        self.physics_dt = max(physics_dt, 1.0 / 240.0)
+        self._world_cls = World
+        self.world: Any | None = None
+        self.articulation: Any | None = None
+        self.root_path: str | None = None
+        self.driven_joint_indices = np.zeros(0, dtype=np.int32)
+        self.driven_joint_names: list[str] = []
+        self.base_joint_positions = np.zeros(0, dtype=np.float64)
+        self.lower_joint_limits = np.zeros(0, dtype=np.float64)
+        self.upper_joint_limits = np.zeros(0, dtype=np.float64)
+        self.joint_amplitudes = np.zeros(0, dtype=np.float64)
+        self.joint_frequencies_hz = np.zeros(0, dtype=np.float64)
+        self.joint_phase_offsets = np.zeros(0, dtype=np.float64)
+        self._articulation_action = modules["ArticulationAction"]
+
+        articulation_root_paths = find_articulation_root_paths(stage, modules)
+        if not articulation_root_paths:
+            return
+
+        if World.instance():
+            World.instance().clear_instance()
+
+        physics_scene_path = ensure_physics_scene(stage, modules)
+        stage_units = float(modules["UsdGeom"].GetStageMetersPerUnit(stage) or 1.0)
+        self.world = World(
+            stage_units_in_meters=stage_units if stage_units > 0 else 1.0,
+            physics_dt=self.physics_dt,
+            rendering_dt=self.physics_dt,
+        )
+
+        self.root_path = articulation_root_paths[0]
+        self.articulation = SingleArticulation(prim_path=self.root_path, name="stage_articulation")
+        self.world.reset()
+        self.articulation.initialize()
+        try:
+            self.articulation.disable_gravity()
+        except Exception:
+            pass
+        self.world.play()
+
+        joint_positions = flatten_float_array(self.articulation.get_joint_positions())
+        dof_count = int(joint_positions.size)
+        if dof_count <= 0:
+            emit_log(
+                f"[articulation] {self.root_path} has no controllable DOFs on {stage_asset_path.name}"
+            )
+            self._disable_runtime()
+            return
+
+        joint_names = list(getattr(self.articulation, "dof_names", []) or [])
+        if len(joint_names) < dof_count:
+            joint_names = [f"joint_{index}" for index in range(dof_count)]
+
+        driven_joint_indices = select_driven_joint_indices(joint_names)
+        if not driven_joint_indices:
+            emit_log(
+                f"[articulation] {self.root_path} has no eligible joints to drive on {stage_asset_path.name}"
+            )
+            self._disable_runtime()
+            return
+
+        try:
+            raw_limits = self.articulation.get_dof_limits()
+        except Exception:
+            raw_limits = None
+        lower_limits, upper_limits = normalize_joint_limits(raw_limits, dof_count)
+
+        driven_joint_array = np.asarray(driven_joint_indices, dtype=np.int32)
+        driven_joint_names = [joint_names[index] for index in driven_joint_indices]
+        base_joint_positions = joint_positions[driven_joint_array].astype(np.float64, copy=True)
+        lower_joint_limits = lower_limits[driven_joint_array]
+        upper_joint_limits = upper_limits[driven_joint_array]
+
+        amplitude_values: list[float] = []
+        for lower_limit, upper_limit in zip(lower_joint_limits, upper_joint_limits, strict=False):
+            if math.isfinite(lower_limit) and math.isfinite(upper_limit) and upper_limit > lower_limit:
+                span = upper_limit - lower_limit
+                amplitude_values.append(max(0.08, min(0.45, span * 0.18)))
+            else:
+                amplitude_values.append(0.22)
+
+        self.driven_joint_indices = driven_joint_array
+        self.driven_joint_names = driven_joint_names
+        self.base_joint_positions = base_joint_positions
+        self.lower_joint_limits = lower_joint_limits
+        self.upper_joint_limits = upper_joint_limits
+        self.joint_amplitudes = np.asarray(amplitude_values, dtype=np.float64)
+        self.joint_frequencies_hz = np.linspace(
+            0.35,
+            0.85,
+            num=len(driven_joint_indices),
+            dtype=np.float64,
+        )
+        self.joint_phase_offsets = np.linspace(
+            0.0,
+            math.pi / 2.0,
+            num=len(driven_joint_indices),
+            endpoint=False,
+            dtype=np.float64,
+        )
+
+        emit_log(
+            f"[world] using physics scene {physics_scene_path} at dt={self.physics_dt:.4f}s"
+        )
+        emit_log(
+            "[articulation] driving "
+            f"{self.root_path} joints: {', '.join(self.driven_joint_names)}"
+        )
+        emit_log(f"[articulation] gravity disabled for {self.root_path}")
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.world is not None
+            and self.articulation is not None
+            and self.driven_joint_indices.size > 0
+        )
+
+    def _disable_runtime(self) -> None:
+        self.stop()
+        if self._world_cls.instance():
+            self._world_cls.instance().clear_instance()
+        self.world = None
+        self.articulation = None
+
+    def step(self, simulation_time: float) -> float:
+        if not self.enabled:
+            return simulation_time
+
+        next_time = simulation_time + self.physics_dt
+        target_positions = self.base_joint_positions + (
+            self.joint_amplitudes
+            * np.sin((math.tau * self.joint_frequencies_hz * next_time) + self.joint_phase_offsets)
+        )
+
+        finite_lower = np.isfinite(self.lower_joint_limits)
+        finite_upper = np.isfinite(self.upper_joint_limits)
+        finite_limits = finite_lower & finite_upper & (self.upper_joint_limits > self.lower_joint_limits)
+        if np.any(finite_limits):
+            safety_margin = np.minimum(
+                (self.upper_joint_limits - self.lower_joint_limits) * 0.08,
+                0.08,
+            )
+            safety_margin = np.maximum(safety_margin, 0.01)
+            target_positions = np.where(
+                finite_limits,
+                np.clip(
+                    target_positions,
+                    self.lower_joint_limits + safety_margin,
+                    self.upper_joint_limits - safety_margin,
+                ),
+                target_positions,
+            )
+
+        self.articulation.apply_action(
+            self._articulation_action(
+                joint_positions=target_positions.astype(np.float64, copy=False),
+                joint_indices=self.driven_joint_indices,
+            )
+        )
+        self.world.step(render=False)
+        return next_time
+
+    def stop(self) -> None:
+        if self.world is None:
+            return
+        try:
+            self.world.stop()
+        except Exception:
+            return
+
+
 def open_best_stage_candidate(
     stage_asset_paths: list[Path],
     modules: dict[str, Any],
@@ -751,16 +1257,20 @@ def open_best_stage_candidate(
             stage_path=stage_asset_path,
             active_time_code=active_time_code,
             modules=modules,
+            prefer_runtime_pose=False,
         )
+        articulation_root_count = len(find_articulation_root_paths(stage, modules))
         emit_log(
             "[stage] candidate "
             f"{stage_asset_path.resolve()} -> "
+            f"{articulation_root_count} articulation roots, "
             f"{stage_manifest['geometry_count']} geometry prims, "
             f"{stage_manifest['renderable_count']} renderables, "
             f"{stage_manifest['prim_count']} prims"
         )
 
         score = (
+            int(articulation_root_count > 0),
             int(stage_manifest["renderable_count"]),
             int(stage_manifest["geometry_count"]),
         )
@@ -803,8 +1313,12 @@ def build_stage_frame(
         if not prim or not prim.IsValid() or not prim.IsActive():
             continue
 
+        position, quaternion = compute_runtime_local_pose(prim, modules)
         local_matrix = compute_local_matrix(prim, time_code, Gf, UsdGeom)
-        position, quaternion, scale = matrix_to_pose(local_matrix, Gf)
+        _fallback_position, _fallback_quaternion, scale = matrix_to_pose(local_matrix, Gf)
+        if position is None or quaternion is None:
+            position = _fallback_position
+            quaternion = _fallback_quaternion
         prim_entries.append(
             {
                 "path": path,
@@ -986,7 +1500,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Websocket host.")
     parser.add_argument("--port", type=int, default=8766, help="Websocket port.")
-    parser.add_argument("--publish-hz", type=float, default=6.0, help="Frame publish frequency.")
+    parser.add_argument("--publish-hz", type=float, default=12.0, help="Frame publish frequency.")
     parser.add_argument(
         "--time-step",
         type=float,
@@ -1008,6 +1522,7 @@ def run_bridge(args: argparse.Namespace) -> None:
 
     app = None
     broadcaster: StageBroadcaster | None = None
+    articulation_driver: ArticulationSineDriver | None = None
 
     try:
         emit_log(f"[isaac] starting bridge for {args.asset.resolve()}")
@@ -1028,21 +1543,37 @@ def run_bridge(args: argparse.Namespace) -> None:
             stage_asset_paths=stage_asset_paths,
             modules=modules,
         )
+        stage = open_stage_in_runtime_context(app, stage_asset_path, modules)
+        (
+            active_time_code,
+            start_time_code,
+            end_time_code,
+            time_codes_per_second,
+            has_animation,
+        ) = resolve_initial_time_code(stage)
+        stage_manifest, tracked_paths = build_stage_manifest(
+            stage=stage,
+            stage_path=stage_asset_path,
+            active_time_code=active_time_code,
+            modules=modules,
+            prefer_runtime_pose=True,
+        )
         emit_log(
             "[stage] selected "
             f"{stage_asset_path.resolve()} with "
             f"{stage_manifest['prim_count']} prims "
             f"({stage_manifest['geometry_count']} geometry prims)"
         )
-        if is_urdf_asset(args.asset) and int(stage_manifest["geometry_count"]) == 0:
+        urdf_visual_source = resolve_urdf_visual_source(args.asset, stage_asset_path)
+        if urdf_visual_source is not None:
             synthetic_prims = build_urdf_visual_fallback_prims(
-                urdf_path=args.asset,
+                urdf_path=urdf_visual_source,
                 stage_manifest=stage_manifest,
             )
             if synthetic_prims:
                 emit_log(
-                    "[urdf] appended "
-                    f"{len(synthetic_prims)} fallback visuals from {args.asset.name}"
+                    "[urdf] supplemented "
+                    f"{len(synthetic_prims)} missing visuals from {urdf_visual_source.name}"
                 )
         emit_log(
             "[stage] manifest ready with "
@@ -1057,9 +1588,25 @@ def run_bridge(args: argparse.Namespace) -> None:
         step_size = max(args.time_step, 0.001)
         elapsed = 0.0
         seq = 0
+        physics_dt = min(publish_step, 1.0 / 60.0)
+        articulation_driver = ArticulationSineDriver(
+            stage=stage,
+            stage_asset_path=stage_asset_path,
+            modules=modules,
+            physics_dt=physics_dt,
+        )
 
         while args.duration <= 0.0 or elapsed < args.duration:
-            app.update()
+            cycle_started_at = time.perf_counter()
+            if articulation_driver.enabled:
+                target_sim_time = elapsed + publish_step
+                while elapsed + 1e-9 < target_sim_time:
+                    active_time_code = articulation_driver.step(elapsed)
+                    elapsed = active_time_code
+            else:
+                app.update()
+                elapsed += publish_step
+
             seq += 1
             broadcaster.broadcast(
                 build_stage_frame(
@@ -1070,24 +1617,27 @@ def run_bridge(args: argparse.Namespace) -> None:
                     modules=modules,
                 )
             )
-            time.sleep(publish_step)
-            elapsed += publish_step
+            cycle_elapsed = time.perf_counter() - cycle_started_at
+            remaining_sleep = publish_step - cycle_elapsed
+            if remaining_sleep > 0:
+                time.sleep(remaining_sleep)
 
-            if has_animation:
-                active_time_code = advance_time_code(
-                    current_time_code=active_time_code,
-                    start_time_code=start_time_code,
-                    end_time_code=end_time_code,
-                    step_size=step_size,
-                )
-            else:
-                active_time_code = start_time_code
+            if not articulation_driver.enabled:
+                if has_animation:
+                    active_time_code = advance_time_code(
+                        current_time_code=active_time_code,
+                        start_time_code=start_time_code,
+                        end_time_code=end_time_code,
+                        step_size=step_size,
+                    )
+                else:
+                    active_time_code = start_time_code
 
-            if has_animation and time_codes_per_second > 0:
-                active_time_code = min(
-                    max(active_time_code, start_time_code),
-                    end_time_code,
-                )
+                if has_animation and time_codes_per_second > 0:
+                    active_time_code = min(
+                        max(active_time_code, start_time_code),
+                        end_time_code,
+                    )
     except BaseException as error:
         if not isinstance(error, KeyboardInterrupt):
             emit_log(f"[isaac] bridge failed: {error}", stream=sys.stderr)
@@ -1102,6 +1652,8 @@ def run_bridge(args: argparse.Namespace) -> None:
                     )
         raise
     finally:
+        if articulation_driver is not None:
+            articulation_driver.stop()
         if broadcaster is not None:
             broadcaster.stop()
         if app is not None:

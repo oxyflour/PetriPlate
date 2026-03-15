@@ -7,6 +7,8 @@ import {
   createAssetAnalysisFromFile,
   createSampleAssetAnalysis,
   createSampleAssetFile,
+  createSampleFrankaAssetAnalysis,
+  createSampleFrankaAssetFile,
   createSampleIsaacAssetAnalysis,
   createSampleIsaacAssetFile,
   resolveIsaacEntrySelection,
@@ -595,6 +597,27 @@ export default function RobotLab() {
     }
   }
 
+  async function loadFrankaSample() {
+    setIsBusy(true);
+    setError(null);
+    try {
+      const [nextAnalysis, nextSourceFile] = await Promise.all([
+        createSampleFrankaAssetAnalysis(),
+        createSampleFrankaAssetFile()
+      ]);
+      setAnalysis(nextAnalysis);
+      setSourceFile(nextSourceFile);
+      setActiveRuntime(nextAnalysis.defaultRuntime);
+      setSelectedMujocoEntryPath(nextAnalysis.runtimeEntries.mujoco?.path || null);
+      setSelectedIsaacEntryPath(nextAnalysis.runtimeEntries.isaacsim?.path || null);
+      setShowAllEntries(false);
+    } catch (nextError) {
+      setError(toMessage(nextError, "Official Franka USD sample could not be loaded."));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
   async function handleSelectedFile(file: File) {
     setIsBusy(true);
     setError(null);
@@ -629,6 +652,9 @@ export default function RobotLab() {
           </button>
           <button className="ghost-button" onClick={() => void loadIsaacSample()} type="button">
             Load Sample USD
+          </button>
+          <button className="ghost-button" onClick={() => void loadFrankaSample()} type="button">
+            Load Franka USD
           </button>
           <button
             className="ghost-button"
